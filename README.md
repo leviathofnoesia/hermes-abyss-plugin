@@ -36,7 +36,7 @@ Plus:
   approvals, platform events, commands, and skill lifecycles.
 - **Health score, trends, and failure taxonomy** — at-a-glance answers to
   "are my agents OK right now?".
-- **Doctor agent** — dispatch a free-Nous agent to diagnose the whole system
+- **Doctor agent** — dispatch a built-in agent to diagnose the whole system
   and propose fixes.
 - **Slash commands** — query everything from the terminal (`/abyss ...`).
 - **Webhook alerting** — optional `ABYSS_WEBHOOK_URL` for out-of-band

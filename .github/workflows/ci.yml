@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backend core suite
+        run: python test_plugin.py
+
+      - name: Wave expansion suite
+        run: python test_wave.py
+
+      - name: Dashboard API suite
+        run: python dashboard/test_api.py
+
+      - name: Frontend syntax check
+        run: node --check desktop/plugin.js

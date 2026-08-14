@@ -1,0 +1,11 @@
+id: abyss
+name: Abyss Dashboard
+description: >-
+  Agent observability: activity feed, calendar, global search, conversation
+  tracing, brain graph, signals & incidents, and wave telemetry (events,
+  streams, API calls, subagents, approvals, commands, platform, skills).
+version: "2.0.0"
+author: Hermes
+license: MIT
+api: dashboard/plugin_api.py
+entry: ../desktop-plugins/abyss/plugin.js

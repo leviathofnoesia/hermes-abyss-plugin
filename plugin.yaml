@@ -1,0 +1,93 @@
+# Abyss plugin manifest — upgraded to manifest v2 (#64165, Aug 2026 wave).
+#
+# v2 fields are advisory + additive: manifest_version versions the file
+# format; api_version is the runtime plugin API generation. `emits`/`listens`
+# declare event-bus contracts (#64164), `config_schema` declares settings the
+# config/state bridge (#64227) reads, and `capabilities` (#64228) declares
+# privileged surfaces — Abyss declares NONE because every hook below is an
+# observer (fail-closed consent default).
+name: abyss
+version: "2.0.0"
+description: >-
+  Abyss Dashboard — Raindrop-style observability for Hermes AI agents.
+  Auto-records tool calls, LLM interactions, session events, streaming
+  telemetry, API requests, subagents, approvals, commands, gateway platform
+  events and skill lifecycle, with self-diagnostics, signal detection,
+  incident clustering, triage, health scoring, trends, failure taxonomy,
+  export, webhook alerting, and an inter-plugin event bus.
+manifest_version: 2
+api_version: 1
+license: MIT
+homepage: https://github.com/NousResearch/hermes-agent
+tags: [observability, monitoring, dashboard, traces, signals, incidents, telemetry]
+python_dependencies: []
+requires_plugins: []
+capabilities: []
+emits:
+  - wave_ready
+  - signal_detected
+  - alert_fired
+  - incident_clustered
+  - doctor_completed
+listens: []
+config_schema:
+  retention_days:
+    type: integer
+    default: 30
+    description: "Prune activity/signals/incidents older than N days on startup."
+  webhook_url:
+    type: string
+    default: ""
+    description: "Slack/Discord/Teams-compatible webhook for alert notifications."
+  stream_signals:
+    type: boolean
+    default: true
+    description: "Emit an empty_stream signal when a streamed response yields zero tokens."
+# Doctor-clean declaration (#64230): the Plugin Doctor compares registered
+# hooks against provides_hooks, so every hook we register must be listed.
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - pre_llm_call
+  - post_llm_call
+  - on_session_start
+  - on_session_end
+  - on_session_reset
+  - on_session_finalize
+  - on_stream_start
+  - on_stream_delta
+  - on_stream_end
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+  - subagent_start
+  - subagent_stop
+  - pre_approval_request
+  - post_approval_response
+  - gateway_platform_event
+  - pre_command
+  - on_skill_lifecycle
+commands:
+  - name: abyss
+    description: "Abyss observability: /abyss stats|health|trends|failures|recent|search|trace|signals|incidents|ack|resolve|diagnostic|webhook|prune|wave"
+  - name: abyss.recent
+    description: "Show recent activity feed"
+    alias: "/activity"
+  - name: abyss.stats
+    description: "Show dashboard statistics"
+    alias: "/a-stats"
+  - name: abyss.search
+    description: "Search activity/memories/sessions"
+    alias: "/a-search"
+  - name: abyss.trace
+    description: "Show conversation trace timeline"
+    alias: "/a-trace"
+  - name: abyss.incidents
+    description: "Show detected incidents and signals"
+    alias: "/a-incidents"
+  - name: abyss.wave
+    description: "Aug-2026 wave surfaces: events|streams|api|subagents|approvals|commands|platform|skills|summary"
+    alias: "/a-wave"
+api:
+  path: dashboard/plugin_api.py
+  entry: ../desktop-plugins/abyss/plugin.js

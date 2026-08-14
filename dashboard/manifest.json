@@ -1,0 +1,12 @@
+{
+  "name": "abyss",
+  "label": "Abyss",
+  "description": "Raindrop-style observability: activity feed, calendar, tracing, brain graph, signals & incidents, wave telemetry (events, streams, API, subagents, approvals, commands, platform, skills)",
+  "icon": "Eye",
+  "version": "2.0.0",
+  "tab": {
+    "path": "/abyss",
+    "position": "end"
+  },
+  "api": "plugin_api.py"
+}

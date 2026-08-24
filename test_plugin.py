@@ -1045,6 +1045,69 @@ def _run_script():
     check("/signals REST contract enriched keys",
           all({"tool_name", "tool_action"} <= set(r.keys()) for r in st_rest), "")
 
+    print("=== 19. Triage filters on /signals and /incidents ===")
+    reset_db()
+    # Seed: 2 error tool_error (one resolved), 1 warning rate_limit, 1 error timeout — all sess-tf
+    _record_self_diagnostic("sess-tf", "tool_a", "err one", "error")
+    _record_self_diagnostic("sess-tf", "tool_b", "err two", "error")
+    _record_self_diagnostic("sess-tf", "tool_c", "quota exhausted", "warning")
+    _record_self_diagnostic("sess-other", "tool_d", "timeout gap", "error")
+    conn = __init__._get_activity_conn()
+    conn.execute("UPDATE signals SET resolved = 1 WHERE description = 'err two'")
+    conn.commit()
+    conn.close()
+
+    rows = handle_request("GET", "/signals", {"session_id": "sess-tf"})
+    check("triage: session filter unchanged", len(rows) == 3, str(len(rows)))
+    tf_type = handle_request("GET", "/signals", {"session_id": "sess-tf", "type": "self_diagnostic"})
+    check("triage: type filter narrows rows",
+          len(tf_type) == 3 and all(r["signal_type"] == "self_diagnostic" for r in tf_type),
+          str(len(tf_type)))
+    tf_type_sev = handle_request("GET", "/signals", {"session_id": "sess-tf", "type": "self_diagnostic", "severity": "error"})
+    check("triage: type+severity combine", len(tf_type_sev) == 2 and all(r["severity"] == "error" for r in tf_type_sev), str(tf_type_sev))
+    tf_open = handle_request("GET", "/signals", {"session_id": "sess-tf", "state": "open"})
+    check("triage: state=open hides resolved", len(tf_open) == 2, str(len(tf_open)))
+    tf_unack = handle_request("GET", "/signals", {"state": "unack"})
+    check("triage: state=unack excludes acknowledged+resolved",
+          len(tf_unack) == 3 and all(r["resolved"] == 0 and r["acknowledged"] == 0 for r in tf_unack),
+          str(len(tf_unack)))
+    _acknowledge_signal(tf_unack[0]["id"])
+    after_ack = handle_request("GET", "/signals", {"state": "unack"})
+    check("triage: unack shrinks after acknowledge", len(after_ack) == len(tf_unack) - 1, str(len(after_ack)))
+    bad_state = handle_request("GET", "/signals", {"state": "bogus"})
+    check("triage: unknown state -> clean 400", isinstance(bad_state, dict) and bad_state.get("code") == 400, str(bad_state))
+    no_match = handle_request("GET", "/signals", {"type": "no_such_type_xyz"})
+    check("triage: non-matching type -> empty list", no_match == [], str(no_match))
+
+    # /incidents parity filters
+    reset_db()
+    _record_self_diagnostic("sess-inc", "tool_a", "gap one")
+    _record_self_diagnostic("sess-inc", "tool_b", "gap two")
+    inc_ids = _cluster_incidents()
+    conn = __init__._get_activity_conn()
+    row = conn.execute("SELECT id FROM incidents").fetchone()
+    conn.close()
+    _update_incident_status(row["id"], "resolved")
+    _record_self_diagnostic("sess-inc2", "tool_c", "gap three")
+    _record_self_diagnostic("sess-inc2", "tool_d", "gap four")
+    _cluster_incidents()
+    incs_all = handle_request("GET", "/incidents")
+    check("incidents: baseline two incidents", len(incs_all) == 2, str(len(incs_all)))
+    incs_open = handle_request("GET", "/incidents", {"open": "true"})
+    check("incidents: open=1 keeps only open", len(incs_open) == 1 and incs_open[0]["status"] == "open", str([i['status'] for i in incs_open]))
+    incs_status = handle_request("GET", "/incidents", {"status": "resolved"})
+    check("incidents: status=resolved still works", len(incs_status) == 1 and incs_status[0]["status"] == "resolved", "")
+    bad_combo = handle_request("GET", "/incidents", {"open": "1", "status": "closed"})
+    check("incidents: open + conflicting status -> 400", isinstance(bad_combo, dict) and bad_combo.get("code") == 400, str(bad_combo))
+
+    # slash-command surface
+    h = _handle_slash("signals --severity=warning --limit=5")
+    check("slash signals --severity renders", "WARNING" in h, h[:120])
+    h = _handle_slash("signals --open --limit=5")
+    check("slash signals --open renders", "Recent signals" in h, h[:120])
+    h = _handle_slash("signals --type=no_such_type_xyz")
+    check("slash signals non-matching type -> empty message", "No signals detected" in h, h[:120])
+
     print()
     print(f"=== RESULT: {PASS} passed, {FAIL} failed ===")
 

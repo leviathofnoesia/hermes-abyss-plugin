@@ -1624,6 +1624,18 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
         elif path == "/signals" and method == "GET":
             limit = _int_param(params, "limit", 50)
             session_filter = params.get("session_id")
+            type_filter = params.get("type")
+            severity_filter = params.get("severity")
+            state_filter = params.get("state") or ""
+            # Triage filters (Aug-2026): at 4,400+ open signals a bare
+            # latest-N list can't answer "show me unresolved errors of type
+            # X". `type` / `severity` match exact values; `state` is one of:
+            #   all         — no resolved/acknowledged filtering (default)
+            #   open        — resolved = 0 (the triage backlog)
+            #   unack       — resolved = 0 AND acknowledged = 0
+            # Unknown values raise _BadRequest -> clean 400, never silent.
+            if state_filter and state_filter not in ("all", "open", "unack"):
+                raise _BadRequest("invalid value for 'state' (use: all, open, unack)")
             # The signals table has NO tool_name column (documented gap: the
             # UI had to guess which tool produced a signal, or join activity
             # client-side). Enrich each row with the source tool + action from
@@ -1633,9 +1645,22 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
             query = ("SELECT s.*, a.tool_name AS tool_name, a.action AS tool_action "
                      "FROM signals s LEFT JOIN activity a ON a.id = s.activity_id")
             query_params = []
+            clauses = []
             if session_filter:
-                query += " WHERE s.session_id = ?"
+                clauses.append("s.session_id = ?")
                 query_params.append(session_filter)
+            if type_filter:
+                clauses.append("s.signal_type = ?")
+                query_params.append(type_filter)
+            if severity_filter:
+                clauses.append("s.severity = ?")
+                query_params.append(severity_filter)
+            if state_filter == "open":
+                clauses.append("s.resolved = 0")
+            elif state_filter == "unack":
+                clauses.append("s.resolved = 0 AND s.acknowledged = 0")
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
             query += " ORDER BY s.timestamp DESC LIMIT ?"
             query_params.append(limit)
             conn = _get_activity_conn()
@@ -1648,11 +1673,26 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
         elif path == "/incidents" and method == "GET":
             limit = _int_param(params, "limit", 50)
             status_filter = params.get("status")
+            severity_filter = params.get("severity")
+            open_only = params.get("open") in (1, True, "1", "true", "True")
+            # Triage filter parity with /signals: severity narrows to exact
+            # value; open=1 keeps only status='open' rows (the actionable
+            # backlog — resolved/closed incidents stay out of the way).
+            if open_only and status_filter not in (None, "", "open"):
+                raise _BadRequest("'open' cannot be combined with a different 'status'")
             query = "SELECT * FROM incidents"
             query_params = []
+            clauses = []
             if status_filter:
-                query += " WHERE status = ?"
                 query_params.append(status_filter)
+                clauses.append("status = ?")
+            if severity_filter:
+                query_params.append(severity_filter)
+                clauses.append("severity = ?")
+            if open_only:
+                clauses.append("status = 'open'")
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
             query += " ORDER BY timestamp DESC LIMIT ?"
             query_params.append(limit)
             conn = _get_activity_conn()
@@ -2276,8 +2316,12 @@ Subcommands:
   performance [days] [limit]   Latency percentiles (tools + models)
   search <query>              Search activity, memories, sessions
   trace <session>            Show trace timeline for a session
-  signals [--session=<sid>]  Show detected signals
-  incidents [--status=<st>]  Show incidents
+  signals [--session=<sid>] [--type=<t>] [--severity=<sev>]
+          [--state=open|unack]
+                                       Show detected signals; --open /
+          --unacked are shorthands for the state filter
+  incidents [--status=<st>] [--severity=<sev>] [--open]
+                                       Show incidents
   ack <signal_id>            Acknowledge a signal
   resolve <signal_id>        Resolve a signal
   resolve-stale [days] [p]   Bulk-resolve stale signals (older than N days,
@@ -2370,18 +2414,42 @@ Category filters:
     if sub == "signals":
         limit = 50
         session_arg = None
+        type_arg = None
+        severity_arg = None
+        state_arg = None
         for arg in argv[1:]:
             if arg.startswith("--limit="):
                 limit = int(arg.split("=", 1)[1])
             elif arg.startswith("--session="):
                 session_arg = arg.split("=", 1)[1]
+            elif arg.startswith("--type="):
+                type_arg = arg.split("=", 1)[1]
+            elif arg.startswith("--severity="):
+                severity_arg = arg.split("=", 1)[1]
+            elif arg == "--state=open" or arg == "--open":
+                state_arg = "open"
+            elif arg == "--state=unack" or arg == "--unacked":
+                state_arg = "unack"
 
         conn = _get_activity_conn()
         query = "SELECT * FROM signals"
         params = []
+        clauses = []
         if session_arg:
-            query += " WHERE session_id = ?"
+            clauses.append("session_id = ?")
             params.append(session_arg)
+        if type_arg:
+            clauses.append("signal_type = ?")
+            params.append(type_arg)
+        if severity_arg:
+            clauses.append("severity = ?")
+            params.append(severity_arg)
+        if state_arg == "open":
+            clauses.append("resolved = 0")
+        elif state_arg == "unack":
+            clauses.append("resolved = 0 AND acknowledged = 0")
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
         rows = conn.execute(query, params).fetchall()
@@ -2394,7 +2462,17 @@ Category filters:
         for r in rows:
             ack = "✓" if r["acknowledged"] else "•"
             res = "✓" if r["resolved"] else ""
-            lines.append(f"  [{ack}{res}] [{r['timestamp'][:19]}] {r['severity'].upper()}: {r['label']} — {r['description'][:80]}")
+            repeat = ""
+            try:
+                _details = json.loads(r["details"]) if r["details"] else {}
+                _n = int(_details.get("repeat_count", 0))
+                if _n > 0:
+                    repeat = f" ×{_n + 1}"
+            except (ValueError, TypeError):
+                pass
+            lines.append(
+                f"  [{ack}{res}] [{r['timestamp'][:19]}] {r['severity'].upper()}: {r['label']}{repeat} — {r['description'][:80]}"
+            )
         return "\n".join(lines)
 
     if sub == "incidents":

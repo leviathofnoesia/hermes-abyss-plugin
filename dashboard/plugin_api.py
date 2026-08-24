@@ -22,8 +22,10 @@ Endpoints:
   GET  /failures                Root-cause failure taxonomy (type/tool/message)
   GET  /export                  Full JSON snapshot of all Abyss tables
   GET  /status                  Lightweight status for the statusbar chip (incl. last_activity_at/last_signal_at/last_error_at liveness timestamps)
-  GET  /signals                 Detected signals (session_id, limit; each row enriched with tool_name/tool_action via activity join)
-  GET  /incidents               Clustered incidents (status, limit)
+  GET  /signals                 Detected signals (session_id, limit, type, severity,
+                                  state=all|open|unack; rows enriched with
+                                  tool_name/tool_action via activity join)
+  GET  /incidents               Clustered incidents (status, limit, severity, open)
   POST /signals/self-diagnostic Record an agent self-diagnostic
   POST /incidents/cluster       Run incident clustering
   POST /prune                   Delete data older than N days (days)
@@ -219,8 +221,18 @@ async def graph(limit: int = 200):
 # --- signals & incidents ----------------------------------------------------
 
 @router.get("/signals")
-async def signals(session_id: Optional[str] = None, limit: int = 50):
-    return _delegate("GET", "/signals", {"session_id": session_id or "", "limit": limit})
+async def signals(
+    session_id: Optional[str] = None,
+    limit: int = 50,
+    type: Optional[str] = None,
+    severity: Optional[str] = None,
+    state: Optional[str] = None,
+):
+    return _delegate("GET", "/signals", {
+        "session_id": session_id or "", "limit": limit,
+        "type": type or "", "severity": severity or "",
+        "state": state or "",
+    })
 
 
 @router.post("/signals/self-diagnostic")
@@ -259,8 +271,16 @@ async def resolve_incident_agent(incident_id: int):
 
 
 @router.get("/incidents")
-async def incidents(status: Optional[str] = None, limit: int = 50):
-    return _delegate("GET", "/incidents", {"status": status or "", "limit": limit})
+async def incidents(
+    status: Optional[str] = None,
+    limit: int = 50,
+    severity: Optional[str] = None,
+    open: bool = False,
+):
+    return _delegate("GET", "/incidents", {
+        "status": status or "", "limit": limit,
+        "severity": severity or "", "open": open,
+    })
 
 
 @router.post("/incidents/cluster")

@@ -123,6 +123,16 @@ function timeTitle(ts) {
   if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric'
   return d.toLocaleString('en-US', opts)
 }
+// Thousands-separator formatting for lifetime counts (tick-47): the strip's
+// ACT tile prints total activities ever recorded (25,875 at shift time) and
+// SIG prints open signals (3,382) — raw, they read as opaque digit blobs
+// ('25875'). en-US grouping matches the dashboard's existing toLocaleString
+// locale use. Non-finite/nullish input passes through unchanged so '—' and
+// fallbacks survive; sub-1,000 counts are byte-identical so the common
+// compact tabular-nums look is untouched.
+function fmtCount(n) {
+  return (typeof n === 'number' && Number.isFinite(n)) ? n.toLocaleString('en-US') : n
+}
 // Silence disclosure for the StatusStrip verdict (tick-42): the counts
 // ('1073 critical') are lifetime/24h totals — a system whose hooks stopped
 // recording (gateway down, plugin misload, session death) still shows big
@@ -860,12 +870,14 @@ function StatusStrip({ ctx, onNavigate }) {
     : 'text-(--ui-green)'
 
   const items = [
-    { label: 'ACT', value: stats?.total_activities ?? 0, tone: 'text-(--ui-text-primary)', hint: 'total activity entries recorded' },
+    // fmtCount (tick-47): lifetime totals (ACT/SIG) exceed four digits —
+    // group them. HLTH stays raw: a 0–100 score never needs a separator.
+    { label: 'ACT', value: fmtCount(stats?.total_activities ?? 0), tone: 'text-(--ui-text-primary)', hint: 'total activity entries recorded' },
     { label: 'HLTH', value: healthScore ?? '—', tone: healthScore != null ? healthTone : 'text-(--ui-text-tertiary)', nav: 'health', hint: 'current health score (0–100) · click to open health' },
-    { label: 'INC', value: status?.incidents_open ?? 0, tone: (status?.incidents_open ?? 0) > 0 ? 'text-(--ui-yellow)' : 'text-(--ui-text-primary)', hint: 'open clustered incidents' },
-    { label: 'CRN', value: stats?.cron_jobs ?? 0, tone: 'text-(--ui-text-primary)', hint: 'active cron jobs tracked' },
-    { label: 'CAT', value: stats?.categories ? Object.keys(stats.categories).length : 0, tone: 'text-(--ui-text-primary)', hint: 'distinct activity categories recorded' },
-    { label: 'SIG', value: openSignals, tone: criticals > 0 ? 'text-(--ui-red)' : openSignals > 0 ? 'text-(--ui-yellow)' : 'text-(--ui-green)', nav: 'signals', hint: 'open signals (silent agent failures) · click to open watch' }
+    { label: 'INC', value: fmtCount(status?.incidents_open ?? 0), tone: (status?.incidents_open ?? 0) > 0 ? 'text-(--ui-yellow)' : 'text-(--ui-text-primary)', hint: 'open clustered incidents' },
+    { label: 'CRN', value: fmtCount(stats?.cron_jobs ?? 0), tone: 'text-(--ui-text-primary)', hint: 'active cron jobs tracked' },
+    { label: 'CAT', value: fmtCount(stats?.categories ? Object.keys(stats.categories).length : 0), tone: 'text-(--ui-text-primary)', hint: 'distinct activity categories recorded' },
+    { label: 'SIG', value: fmtCount(openSignals), tone: criticals > 0 ? 'text-(--ui-red)' : openSignals > 0 ? 'text-(--ui-yellow)' : 'text-(--ui-green)', nav: 'signals', hint: 'open signals (silent agent failures) · click to open watch' }
   ]
 
   if (loading && !stats && !status) {
@@ -953,7 +965,8 @@ function StatusStrip({ ctx, onNavigate }) {
                 className: 'inline-block h-1.5 w-1.5 rounded-full',
                 style: { backgroundColor: criticals > 0 ? 'var(--ui-red)' : openSignals > 0 ? 'var(--ui-yellow)' : 'var(--ui-green)' }
               }),
-              criticals > 0 ? `${criticals} critical` : openSignals > 0 ? `${openSignals} open` : 'all clear',
+              // fmtCount (tick-47): criticals/open can exceed four digits.
+              criticals > 0 ? `${fmtCount(criticals)} critical` : openSignals > 0 ? `${fmtCount(openSignals)} open` : 'all clear',
               idleEl,
               resolvingEl,
               '›'
@@ -965,7 +978,7 @@ function StatusStrip({ ctx, onNavigate }) {
                 className: 'inline-block h-1.5 w-1.5 rounded-full',
                 style: { backgroundColor: criticals > 0 ? 'var(--ui-red)' : openSignals > 0 ? 'var(--ui-yellow)' : 'var(--ui-green)' }
               }),
-              criticals > 0 ? `${criticals} critical` : openSignals > 0 ? `${openSignals} open` : 'all clear',
+              criticals > 0 ? `${fmtCount(criticals)} critical` : openSignals > 0 ? `${fmtCount(openSignals)} open` : 'all clear',
               idleEl,
               resolvingEl
             ]
@@ -981,7 +994,7 @@ function StatusStrip({ ctx, onNavigate }) {
             role: 'status',
             'aria-live': 'polite',
             className: 'sr-only',
-            children: `abyss health: ${criticals > 0 ? `${criticals} critical` : openSignals > 0 ? `${openSignals} open` : 'all clear'}${idle ? ` · idle ${idle.text}` : ''}${resolvingCount > 0 ? ` · ${resolvingCount} resolving` : ''}`
+            children: `abyss health: ${criticals > 0 ? `${fmtCount(criticals)} critical` : openSignals > 0 ? `${fmtCount(openSignals)} open` : 'all clear'}${idle ? ` · idle ${idle.text}` : ''}${resolvingCount > 0 ? ` · ${resolvingCount} resolving` : ''}`
           })
         ]
       })
@@ -3489,7 +3502,9 @@ function HealthView({ ctx }) {
             jsx('span', { className: 'inline-block h-2.5 w-2.5 rounded-full', style: { backgroundColor: level === 'critical' ? 'var(--ui-red)' : (level === 'degraded' || level === 'fair') ? 'var(--ui-yellow)' : 'var(--ui-green)' }, children: '' }),
             jsx('span', { className: cn('capitalize', levelTone), children: level })
           ]}),
-          jsx('span', { className: 'text-xs text-(--ui-text-tertiary) abyss-mono tabular-nums', children: `${counts.errors ?? 0} errors · ${counts.signals_open ?? 0} open signals · ${counts.incidents_open ?? 0} open incidents · ${counts.activity_24h ?? 0} actions/24h` }),
+          // fmtCount (tick-47): these lifetime/24h totals exceed four digits
+          // at current data volumes (1,073 errors · 4,437 open signals).
+          jsx('span', { className: 'text-xs text-(--ui-text-tertiary) abyss-mono tabular-nums', children: `${fmtCount(counts.errors ?? 0)} errors · ${fmtCount(counts.signals_open ?? 0)} open signals · ${fmtCount(counts.incidents_open ?? 0)} open incidents · ${fmtCount(counts.activity_24h ?? 0)} actions/24h` }),
           idleEl,
           jsxs('div', {
             className: 'ml-auto flex items-center gap-1.5',
@@ -4221,7 +4236,7 @@ function AbyssStatusChip({ ctx }) {
             },
             children: ''
           }),
-          score !== null && score !== undefined ? `${score}` : open,
+          score !== null && score !== undefined ? `${score}` : fmtCount(open),
           // Resolving marker: inline var(--ui-blue) — no compiled
           // text-(--ui-blue) class exists in the host bundle (only
           // red/yellow/green/accent do); matches the Calendar "running"
@@ -5617,3 +5632,25 @@ export default {
 // unchanged). Verified post-edit: node --input-type=module --check PASS +
 // CJS check OK; string-aware brace/paren balance clean; sr-only confirmed
 // compiled (StatusStrip precedent); no backend/Python touched.
+//
+// night-shift-tick-47 (this shift): thousands-separator formatting for
+// lifetime counts — the glance stopped being parseable at current data
+// volumes. The strip's ACT tile printed total activities as '25875' and SIG
+// open signals as '3382'; the HealthView header line printed
+// '1073 errors · 4437 open signals · ...'; every four+ digit count rendered
+// as an opaque digit blob. Now a fmtCount() helper (en-US grouping, matching
+// the dashboard's existing toLocaleString locale use) is applied at every
+// big-count render site:
+//   1. StatusStrip tiles ACT/INC/CRN/CAT/SIG (HLTH stays raw — a 0–100
+//      score never needs a separator).
+//   2. StatusStrip verdict phrase ×3 — nav Button branch, plain-span branch,
+//      and the sr-only live-region echo (a11y parity kept: screen readers
+//      now hear '3,382 open' with the same grouping).
+//   3. HealthView header summary line (errors / open signals / open
+//      incidents / actions-24h).
+//   4. Chip fallback count (shown only when /status has no score yet).
+// Sub-1,000 counts are byte-identical, so compact tabular tiles are
+// unchanged in the common case. Zero new imports, zero hooks, zero class
+// tokens added. Verified post-edit: node --input-type=module --check PASS +
+// CJS check OK; string-aware brace/paren balance clean; no backend/Python
+// touched.

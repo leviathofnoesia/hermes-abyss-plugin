@@ -470,6 +470,27 @@ def get_status() -> dict:
     finally:
         conn.close()
     health = get_health()
+    # Multi-store capture liveness (added 2026-08-24): the plugin pins its
+    # data dir from HERMES_PROFILE_HOME at import time, so processes launched
+    # without it silently write to <HERMES_HOME>/abyss-data instead and the
+    # single-store view above can look dead (or blind) while captures flow
+    # elsewhere. Attach a compact verdict so the statusbar chip / pollers can
+    # flag split-brain or capture outage without scanning stores themselves.
+    try:
+        from abyss_doctor import _capture_status
+
+        _cap = _capture_status()
+        capture_summary = {
+            "status": _cap["status"],
+            "summary": _cap["summary"],
+            "freshest_capture_at": min(
+                (s["last_capture"] for s in _cap["stores"]
+                 if s.get("last_capture")),
+                default=None,
+            ),
+        }
+    except Exception:
+        capture_summary = None
     return {
         "score": health["score"],
         "level": health["level"],
@@ -485,5 +506,6 @@ def get_status() -> dict:
         "last_activity_at": last_activity[0] if last_activity else None,
         "last_signal_at": last_signal[0] if last_signal else None,
         "last_error_at": last_error[0] if last_error else None,
+        "capture": capture_summary,
         "generated_at": datetime.now().isoformat(),
     }

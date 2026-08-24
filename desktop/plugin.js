@@ -4187,6 +4187,26 @@ function AbyssDashboard({ ctx }) {
   // callback keeps the contract tidy.
   const clearTracePreset = useCallback(() => setTracePreset(null), [])
 
+  // Keyboard tab navigation (tick-52): the tab bar is a horizontally
+  // scrollable row of eight triggers, so a keyboard operator had to Tab
+  // through every trigger (and any in-tab focusables) to reach a distant
+  // view — and there was no shortcut surface at all (the only keydown
+  // handlers in the file are canvas-local). Alt+1..8 jumps straight to a
+  // view, matching the position shown in the tab bar. Modifier guards keep
+  // it from stealing plain-digit typing or OS combos; digits come from
+  // ev.key so numpad works too.
+  useEffect(() => {
+    const onKey = (ev) => {
+      if (!ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) return
+      const n = Number(ev.key)
+      if (!Number.isInteger(n) || n < 1 || n > ABYSS_TABS.length) return
+      try { ev.preventDefault() } catch { /* event may be read-only */ }
+      selectTab(ABYSS_TABS[n - 1].value)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [selectTab])
+
   useEffect(() => {
     ensureConsoleCss()
     if (ctx) {
@@ -4218,11 +4238,19 @@ function AbyssDashboard({ ctx }) {
         children: [
           jsx(TabsList, {
             className: 'flex w-full items-center justify-start overflow-x-auto shrink-0 bg-(--ui-bg-quaternary) border-b border-(--ui-stroke-tertiary)',
-            children: ABYSS_TABS.map(tab =>
+            // tick-52 disclosure: each trigger advertises its Alt+N jump in a
+            // hover title + aria-keyshortcuts, so the shortcut surface is
+            // discoverable from the tab bar itself (no docs hunt). The
+            // listener lives in AbyssDashboard's keydown effect; if the SDK
+            // TabsTrigger drops unknown props the hint is simply absent —
+            // the shortcut itself is unaffected.
+            children: ABYSS_TABS.map((tab, i) =>
               jsx(TabsTrigger, {
                 key: tab.value,
                 value: tab.value,
                 className: 'text-xs h-8 abyss-mono shrink-0',
+                title: `${tab.label} — alt+${i + 1}`,
+                'aria-keyshortcuts': `Alt+${i + 1}`,
                 children: tab.label
               })
             )
@@ -5822,3 +5850,25 @@ export default {
 // syntax checks PASS, string-aware brace balance clean, simulated boundary
 // lifecycle (latch → retry → tab-switch clear) passes. No backend/Python
 // touched.
+//
+// night-shift-tick-52 (this shift): keyboard tab navigation (Alt+1..8).
+// The tab bar is a horizontally scrollable row of eight triggers, so a
+// keyboard operator had to Tab through every trigger — and any focusables
+// inside the active view — to reach a distant view; the only keydown
+// handlers in the whole file were canvas-local. Now:
+//   1. A window keydown listener in AbyssDashboard maps Alt+1..8 to
+//      selectTab(ABYSS_TABS[n-1].value), routing through the same funnel
+//      as clicks/drills/jumps so persistence (tick-50) applies identically.
+//      Modifier guards (no ctrl/meta/shift) keep it from stealing plain
+//      digit typing or OS combos; ev.preventDefault only fires on an
+//      actual match.
+//   2. Disclosure on the surface itself: each TabsTrigger gains a hover
+//      title '<label> — alt+N' plus aria-keyshortcuts, so the shortcut is
+//      discoverable from the tab bar without leaving the app.
+//   Verified post-edit: node --input-type=module --check PASS + CJS check
+//   OK; string-aware brace/paren balance clean; hook order unchanged (one
+//   useEffect added between existing hooks, deps [selectTab] stable);
+//   listener add/remove paired; simulated key dispatch (alt+1..8 → tab,
+//   plain digits ignored, alt+9 out of range ignored) passes. No new
+//   imports, zero fetch paths touched, no class tokens added. No backend/
+//   Python touched.

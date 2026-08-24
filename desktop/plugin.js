@@ -4230,6 +4230,22 @@ function AbyssStatusChip({ ctx }) {
             className: 'inline-block h-1.5 w-1.5 rounded-full',
             style: { backgroundColor: 'var(--ui-blue)' },
             children: ''
+          }),
+          // Screen-reader parity with the pane's StatusStrip echoes (ticks
+          // 27/39/44): the chip's idle tone, red/blue companion dots and
+          // hover title are all visual-only — a screen-reader operator
+          // tabbing through the statusbar hears just 'abyss 87' and cannot
+          // tell critical silence from a healthy score, nor that a
+          // cloud-agent fix is in flight. This sr-only child joins the
+          // button's accessible name so focusing the chip speaks the full
+          // disclosure (idle phrase + level + in-flight count). sr-only is
+          // verified compiled in the host bundle (StatusStrip precedent).
+          jsx('span', {
+            className: 'sr-only',
+            children: 'abyss health ' + (score ?? 'unknown')
+              + (level ? `, ${level}` : '')
+              + (idle ? `, idle ${idle.text}` : '')
+              + (resolvingCount > 0 ? `, ${resolvingCount} cloud-agent fix${resolvingCount === 1 ? '' : 'es'} in flight` : '')
           })
         ]
       }),
@@ -5586,3 +5602,18 @@ export default {
 //   title concatenation). Verified post-edit: node --input-type=module
 //   --check PASS + CJS check OK; check-hook-order clean; braces/parens
 //   balanced. No backend/Python touched.
+//
+// night-shift-tick-46 (this shift): statusbar-chip screen-reader parity —
+// the always-visible surface's disclosures were visual-only. The chip's
+// idle tone, red/blue companion dots and hover title (ticks 42/45) never
+// reach a screen reader: an operator tabbing the statusbar heard just
+// 'abyss 87' and could not tell critical silence from a healthy score,
+// nor that a cloud-agent fix was in flight — the exact silent-to-AT class
+// ticks 27/39/44 closed on the pane's StatusStrip, which the chip never
+// inherited. Now an sr-only span inside the chip's status span joins the
+// button's accessible name so focusing it speaks the full disclosure:
+// 'abyss health 87, fair, idle 2h, 1 cloud-agent fix in flight'. Zero new
+// imports, zero hooks (one conditional sr-only child only; visible pixels
+// unchanged). Verified post-edit: node --input-type=module --check PASS +
+// CJS check OK; string-aware brace/paren balance clean; sr-only confirmed
+// compiled (StatusStrip precedent); no backend/Python touched.

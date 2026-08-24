@@ -2281,8 +2281,10 @@ Subcommands:
   ack <signal_id>            Acknowledge a signal
   resolve <signal_id>        Resolve a signal
   resolve-stale [days] [p]   Bulk-resolve stale signals (older than N days,
-                             optional session_id prefix, e.g. cron_; append
-                             'close' to close emptied incidents)
+                             optional session_id prefix, e.g. cron_; use
+                             --type <t> to filter one signal type (e.g.
+                             empty_stream); appending 'close' closes
+                             emptied incidents)
   resolve-agent <id>         Dispatch a free-Nous agent to diagnose + fix a signal/incident
   doctor                     Dispatch the doctor agent for a full diagnosis
   incident <id> <action>     Acknowledge/resolve/reopen/close an incident
@@ -2467,17 +2469,31 @@ Category filters:
     if sub == "resolve-stale":
         """Bulk-resolve old signals, e.g. /abyss resolve-stale 7 cron_
 
-        Syntax: /abyss resolve-stale [days] [session_prefix] [close]
+        Syntax: /abyss resolve-stale [days] [session_prefix] [--type <t>] [close]
         - days: resolve signals older than N days (default 7)
         - session_prefix: only signals whose session_id starts with this
-          (e.g. cron_ for overnight watcher noise)
+          (e.g. cron_ for overnight watcher noise); omit (or use --type)
+          when filtering by signal type alone
+        - --type <t>: only resolve signals of this type, e.g. --type
+          empty_stream for flood cleanup, --type tool_error
         - close: also close incidents left with zero open signals
         """
         days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 7
-        prefix = argv[2] if len(argv) > 2 else None
-        close_incidents = any(a == "close" for a in argv[3:]) if len(argv) > 3 else False
+        prefix = None
+        sig_type = None
+        close_incidents = False
+        rest = argv[2:]
+        if rest and not rest[0].startswith("--"):
+            prefix = rest.pop(0)
+        while rest:
+            a = rest.pop(0)
+            if a in ("--type", "-t") and rest:
+                sig_type = rest.pop(0)
+            elif a in ("--close", "close"):
+                close_incidents = True
         result = _resolve_signals_bulk(
             session_prefix=prefix,
+            signal_type=sig_type,
             older_than_days=days,
             close_empty_incidents=close_incidents,
         )

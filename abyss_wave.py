@@ -43,9 +43,10 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("hermes.plugins.abyss.wave")
@@ -62,6 +63,9 @@ SETTINGS: Dict[str, Any] = {
     "retention_days": int(os.environ.get("ABYSS_RETENTION_DAYS", "30") or 30),
     "webhook_url": os.environ.get("ABYSS_WEBHOOK_URL", ""),
     "stream_signals": True,
+    "stream_signal_coalesce_minutes": int(
+        os.environ.get("ABYSS_STREAM_COALESCE_MINUTES", "10") or 10
+    ),
 }
 
 # Redaction patterns registered with the host redaction engine (#65449) and
@@ -80,6 +84,104 @@ _COMPILED_PATTERNS = [re.compile(p) for p in _REDACTION_PATTERNS]
 _STREAMS: Dict[tuple, Dict[str, Any]] = {}
 _STREAM_MAX = 512
 _STREAM_LOCK = threading.Lock()
+
+# Keys whose in-memory accumulator was evicted at the _STREAM_MAX cap. When
+# their late on_stream_end arrives (accumulator already gone), the stream row
+# is STILL persisted but flagged as telemetry-incomplete, and NO empty_stream
+# signal is fired — eviction is a tracking limit, not evidence the stream
+# produced zero tokens. Without this, a healthy stream evicted under heavy
+# concurrency (>512 parallel streams: subagent storms, multi-gateway) was
+# re-created as a chars=0 placeholder by its own on_stream_end and fired a
+# FALSE empty_stream signal that polluted the Watch tab and pinned the health
+# score. Ends remove entries promptly; the cap trims the set if it ever grows
+# past _STREAM_MAX * 2 (i.e. ends never arrive for a pathological burst).
+_EVICTED: set = set()
+
+# A stream accumulator that never received on_stream_end within this many
+# seconds is presumed stuck (provider hang, dropped hook, killed process).
+# _on_stream_start sweeps these and persists them as finished=0 rows PLUS a
+# `stuck_stream` signal instead of letting them vanish silently at the cap.
+_STREAM_STUCK_AFTER = 900.0
+
+# Backoff (seconds) between the two attempts _wave_with_retry makes when the
+# activity DB reports 'database is locked' — a transient cross-process WAL
+# writer collision. busy_timeout=5000ms usually resolves the contention on its
+# own; one retry with a short sleep absorbs the rare longer collision without
+# resorting to a much larger busy_timeout that would block the hook hot path.
+_LOCK_RETRY_SLEEP = 0.15
+
+
+def _is_lock_error(exc: Exception) -> bool:
+    """True for SQLite 'database is locked' / 'database table is locked'.
+
+    These are transient, expected races under concurrent cross-process access
+    (the live Hermes gateway + the dashboard webserver + cron scripts all share
+    one activity.db). They are NOT operator-actionable and must not spam the
+    logs at WARNING level — see _wave_with_retry / the write helpers below.
+    """
+    if isinstance(exc, sqlite3.OperationalError):
+        msg = str(exc).lower()
+        return "locked" in msg
+    return False
+
+
+_SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2, "critical": 3, "fatal": 4}
+
+
+def _severity_rank(severity: Any) -> int:
+    """Rank a severity string for coalescing escalation; unknown -> warning."""
+    return _SEVERITY_RANK.get(str(severity or "").lower(), 1)
+
+
+def _wave_with_retry(op: str, table: str, runnable):
+    """Run a single-statement DB write, retrying 'database is locked' once.
+
+    Args:
+        op: short label for the log message ("insert"/"update"/"signal").
+        table: target wave table name, for the log message.
+        runnable: callable(conn) -> result that performs the execute+commit on
+            ``conn`` and returns whatever the caller wants to surface (lastrowid
+            for inserts, rowcount>0 bool for updates). It must NOT close the
+            connection — this helper owns the connection lifecycle.
+
+    Transient lock contention is logged at DEBUG (not WARNING): cross-process
+    writers on a shared WAL database collide regularly and the fail-open
+    contract means the loss of one audit row is acceptable. Genuine programming
+    errors (schema mismatch, malformed SQL) still surface at WARNING.
+    """
+    from __init__ import _get_activity_conn
+
+    _ensure_tables()
+    last_exc = None
+    for attempt in (1, 2):
+        conn = None
+        try:
+            conn = _get_activity_conn()
+            return runnable(conn)
+        except Exception as exc:
+            last_exc = exc
+            is_lock = _is_lock_error(exc)
+            if attempt == 1 and is_lock:
+                # Close this connection before sleeping so we don't hold a
+                # half-open transaction across the backoff.
+                continue
+            # Either we already retried, or this is a non-lock failure.
+            if is_lock:
+                logger.debug(
+                    "Abyss wave %s into %s deferred (database locked after retry): %s",
+                    op, table, exc,
+                )
+            else:
+                logger.warning("Abyss wave %s into %s failed: %s", op, table, exc)
+            return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if last_exc is not None and _is_lock_error(last_exc) and attempt == 1:
+                time.sleep(_LOCK_RETRY_SLEEP)
 
 
 def _mask_secrets(value: str) -> str:
@@ -106,6 +208,66 @@ _WAVE_TABLES = (
     "platform_events",
     "skills",
 )
+
+
+def prune_wave_data(days: int = 30) -> dict:
+    """Delete wave-table rows older than ``days`` from the activity DB.
+
+    Every wave surface (plugin_events, streams, api_requests, subagents,
+    approvals, commands, platform_events, skills) appends a row per event and
+    all of them share the activity DB ``timestamp`` column. The core
+    ``_prune_data`` used to ignore these tables, so ``retention_days`` was
+    silently no-op for the Aug-2026 wave surfaces and the tables grew
+    unbounded. ``_prune_data`` calls this so retention applies everywhere.
+
+    Returns per-table deleted-row counts; ``days <= 0`` is a no-op returning
+    zero counts (same contract as the core pruner). Fail-open: any DB error
+    returns the partial counts and never raises into a hook/command path.
+    """
+    counts = {table: 0 for table in _WAVE_TABLES}
+    if days <= 0:
+        return counts
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    try:
+        from __init__ import _get_activity_conn
+
+        conn = _get_activity_conn()
+        try:
+            for table in _WAVE_TABLES:
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,)
+                )
+                counts[table] = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("Abyss wave prune failed: %s", exc)
+    return counts
+
+
+def clear_wave_data() -> dict:
+    """Delete every wave-table row (irreversible, mirrors ``/abyss clean``).
+
+    ``/abyss clean`` previously cleared activity/signals/incidents/traces but
+    left the wave tables intact, so a "clear all data" left stream/API/approval
+    history behind. The clean command calls this so the wipe is actually a wipe.
+    """
+    counts = {table: 0 for table in _WAVE_TABLES}
+    try:
+        from __init__ import _get_activity_conn
+
+        conn = _get_activity_conn()
+        try:
+            for table in _WAVE_TABLES:
+                cur = conn.execute(f"DELETE FROM {table}")
+                counts[table] = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("Abyss wave clear failed: %s", exc)
+    return counts
 
 
 def wave_init_db(conn) -> None:
@@ -258,49 +420,43 @@ def _wave_insert(table: str, **fields: Any) -> Optional[int]:
     — re-acquiring it from the same thread deadlocks. Wave tables are written
     as single autocommit statements under SQLite WAL with a busy_timeout, so
     concurrent writers serialize at the DB level instead.
-    """
-    try:
-        from __init__ import _get_activity_conn
 
-        _ensure_tables()
-        cols = [k for k in fields.keys() if fields[k] is not None]
-        vals = [fields[k] for k in cols]
-        sql = (
-            f"INSERT INTO {table} ({', '.join(cols)}) "
-            f"VALUES ({', '.join('?' * len(cols))})"
-        )
-        conn = _get_activity_conn()
-        try:
-            cur = conn.execute(sql, vals)
-            conn.commit()
-            return cur.lastrowid
-        finally:
-            conn.close()
-    except Exception as exc:
-        logger.warning("Abyss wave insert into %s failed: %s", table, exc)
-        return None
+    A transient ``database is locked`` (a cross-process WAL writer collision)
+    is retried once with a short backoff via :func:`_wave_with_retry`, and the
+    warning is downgraded to DEBUG because it is not operator-actionable.
+    """
+    cols = [k for k in fields.keys() if fields[k] is not None]
+    vals = [fields[k] for k in cols]
+    sql = (
+        f"INSERT INTO {table} ({', '.join(cols)}) "
+        f"VALUES ({', '.join('?' * len(cols))})"
+    )
+
+    def _run(conn):
+        cur = conn.execute(sql, vals)
+        conn.commit()
+        return cur.lastrowid
+
+    return _wave_with_retry("insert", table, _run)
 
 
 def _wave_update(table: str, set_fields: Dict[str, Any], where: str, where_args: list) -> bool:
-    """Update rows in a wave table. Thread-safe, fail-open (see _wave_insert)."""
-    try:
-        from __init__ import _get_activity_conn
+    """Update rows in a wave table. Thread-safe, fail-open (see _wave_insert).
 
-        _ensure_tables()
-        cols = [k for k, v in set_fields.items() if v is not None]
-        assignments = ", ".join(f"{k} = ?" for k in cols)
-        sql = f"UPDATE {table} SET {assignments} WHERE {where}"
-        args = [set_fields[k] for k in cols] + where_args
-        conn = _get_activity_conn()
-        try:
-            cur = conn.execute(sql, args)
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            conn.close()
-    except Exception as exc:
-        logger.warning("Abyss wave update on %s failed: %s", table, exc)
-        return False
+    Retries a transient ``database is locked`` once — see :func:`_wave_with_retry`.
+    """
+    cols = [k for k, v in set_fields.items() if v is not None]
+    assignments = ", ".join(f"{k} = ?" for k in cols)
+    sql = f"UPDATE {table} SET {assignments} WHERE {where}"
+    args = [set_fields[k] for k in cols] + where_args
+
+    def _run(conn):
+        cur = conn.execute(sql, args)
+        conn.commit()
+        return cur.rowcount > 0
+
+    res = _wave_with_retry("update", table, _run)
+    return bool(res)
 
 
 _TABLES_READY = False
@@ -362,34 +518,98 @@ def _wave_signal(
     description: str,
     session_id: str = "",
 ) -> Optional[int]:
-    """Insert a classifier-style signal row with source 'wave'."""
-    try:
-        from __init__ import _get_activity_conn
+    """Insert a classifier-style signal row with source 'wave'.
 
-        _ensure_tables()
-        conn = _get_activity_conn()
+    Retries a transient ``database is locked`` once — see :func:`_wave_with_retry`.
+    """
+    ts = datetime.now().isoformat()
+    sid = session_id or None
+
+    def _run(conn):
+        cur = conn.execute(
+            """INSERT INTO signals
+               (timestamp, signal_type, severity, label, description,
+                session_id, source)
+               VALUES (?, ?, ?, ?, ?, ?, 'wave')""",
+            (ts, signal_type, severity, label, description, sid),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+    return _wave_with_retry("signal", "signals", _run)
+
+
+def _wave_signal_coalesced(
+    signal_type: str,
+    severity: str,
+    label: str,
+    description: str,
+    session_id: str = "",
+    coalesce_minutes: Optional[int] = None,
+) -> Optional[int]:
+    """Insert a wave signal, coalescing same-type repeats per session.
+
+    A context-window-exhausted session emits an ``empty_stream`` signal for
+    EVERY zero-token stream — hundreds of identical rows in one session (628
+    observed in ``20260821_005355_cde5b755``; 2,270 unresolved rows total).
+    Each row is a separate line in the Watch tab and inflates the open-signal
+    count, pinning the health score's signal component at 0 while the true
+    cause is a single context-window exhaustion.
+
+    When the most recent unresolved signal of this type for the same session
+    falls within ``coalesce_minutes`` (config -> ``stream_signal_coalesce_minutes``,
+    default 10), this bumps its ``details.repeat_count`` / ``last_repeat_at``
+    instead of inserting a new row. If the repeat's severity ranks HIGHER than
+    the stored row's (e.g. warning -> error), the stored row's severity is
+    escalated so a worsening failure is never hidden behind a repeat count.
+    Returns the new/updated signal id, or None on failure (fail-open, matching
+    :func:`_wave_signal`).
+    """
+    if not session_id:
+        return _wave_signal(signal_type, severity, label, description, session_id)
+    window = coalesce_minutes if coalesce_minutes is not None else int(
+        SETTINGS.get("stream_signal_coalesce_minutes", 10) or 10
+    )
+    cutoff = (datetime.now() - timedelta(minutes=window)).isoformat()
+
+    def _run(conn):
+        row = conn.execute(
+            """SELECT id, details, severity FROM signals
+               WHERE signal_type = ? AND session_id = ?
+                 AND resolved = 0 AND timestamp >= ?
+               ORDER BY timestamp DESC, id DESC LIMIT 1""",
+            (signal_type, session_id, cutoff),
+        ).fetchone()
+        if row is None:
+            return None  # no recent unresolved signal -> caller inserts fresh
         try:
-            cur = conn.execute(
-                """INSERT INTO signals
-                   (timestamp, signal_type, severity, label, description,
-                    session_id, source)
-                   VALUES (?, ?, ?, ?, ?, ?, 'wave')""",
-                (
-                    datetime.now().isoformat(),
-                    signal_type,
-                    severity,
-                    label,
-                    description,
-                    session_id or None,
-                ),
+            details = json.loads(row["details"]) if row["details"] else {}
+        except (ValueError, TypeError):
+            details = {}
+        details["repeat_count"] = int(details.get("repeat_count", 0)) + 1
+        details["last_repeat_at"] = datetime.now().isoformat()
+        # Severity escalation: a repeat that is WORSE than the original
+        # signal must escalate the stored row, not hide behind repeat_count.
+        # (e.g. a retryable 429 warning storm that turns into a hard 500
+        # error — the unresolved row must reflect the worst observed state
+        # so health scoring / Watch-tab triage see the real severity.)
+        if _severity_rank(severity) > _severity_rank(row["severity"]):
+            conn.execute(
+                "UPDATE signals SET details = ?, severity = ? WHERE id = ?",
+                (json.dumps(details), severity, row["id"]),
             )
-            conn.commit()
-            return cur.lastrowid
-        finally:
-            conn.close()
-    except Exception as exc:
-        logger.warning("Abyss wave signal insert failed: %s", exc)
-        return None
+        else:
+            conn.execute(
+                "UPDATE signals SET details = ? WHERE id = ?",
+                (json.dumps(details), row["id"]),
+            )
+        conn.commit()
+        return row["id"]
+
+    merged = _wave_with_retry("coalesce", "signals", _run)
+    if merged:
+        return merged
+    return _wave_signal(signal_type, severity, label, description, session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +712,63 @@ def _on_session_finalize(
     )
 
 
+def _sweep_stuck_streams() -> int:
+    """Persist + signal streams that started but never received on_stream_end.
+
+    A stream that opened an accumulator but never delivered an on_stream_end
+    (provider hang, dropped hook, killed process) used to be silently evicted
+    at the _STREAM_MAX cap — no durable row, no signal. Now, whenever a new
+    stream starts, we sweep accumulators older than _STREAM_STUCK_AFTER and
+    record them as finished=0 streams rows plus a `stuck_stream` warning
+    signal so the silent failure is observable.
+    """
+    now = time.time()
+    stuck = []
+    with _STREAM_LOCK:
+        for key, st in list(_STREAMS.items()):
+            if now - st.get("started", now) > _STREAM_STUCK_AFTER:
+                stuck.append((key, st))
+        for key, _ in stuck:
+            _STREAMS.pop(key, None)
+    if not stuck:
+        return 0
+    for (session_id, turn_id), st in stuck:
+        started = st.get("started", now)
+        try:
+            _wave_insert(
+                "streams",
+                timestamp=datetime.now().isoformat(),
+                session_id=str(session_id or ""),
+                turn_id=str(turn_id or ""),
+                model=st.get("model", "") or "",
+                provider=st.get("provider", "") or "",
+                surface=st.get("surface", "") or "",
+                iteration=st.get("iteration", 0),
+                started_at=datetime.fromtimestamp(started).isoformat(),
+                ended_at=datetime.fromtimestamp(now).isoformat(),
+                chars=st.get("chars", 0),
+                deltas=st.get("deltas", 0),
+                kind_counts=json.dumps(st.get("kinds", {}), default=str),
+                first_token_ms=st.get("first_token_ms"),
+                finished=0,
+                error="stuck: no on_stream_end (provider hang or dropped hook)",
+                duration_ms=int((now - started) * 1000),
+            )
+            if SETTINGS.get("stream_signals", True):
+                _wave_signal(
+                    "stuck_stream",
+                    "warning",
+                    "Stuck LLM stream",
+                    f"Streaming response never finished: session "
+                    f"{str(session_id or '')[:8]}, turn {str(turn_id or '')[:8]} "
+                    f"(no on_stream_end after {(now - started):.0f}s).",
+                    session_id or "",
+                )
+        except Exception as exc:
+            logger.debug("Abyss stuck-stream sweep failed for %s: %s", (session_id, turn_id), exc)
+    return len(stuck)
+
+
 def _on_stream_start(
     turn_id: str = "",
     iteration: int = 0,
@@ -502,6 +779,12 @@ def _on_stream_start(
     **_,
 ) -> None:
     """Open an in-memory accumulator for one streaming response."""
+    # Sweep orphaned accumulators (streams that started but never received
+    # on_stream_end) before adding the new one — see _sweep_stuck_streams.
+    try:
+        _sweep_stuck_streams()
+    except Exception:
+        pass
     key = (str(session_id or ""), str(turn_id or ""))
     with _STREAM_LOCK:
         _STREAMS[key] = {
@@ -516,10 +799,16 @@ def _on_stream_start(
             "session_id": session_id or "",
             "turn_id": turn_id or "",
         }
-        # Bound memory: evict the oldest entry beyond the cap.
+        # Bound memory: evict the oldest entry beyond the cap. The evicted
+        # key is tracked (bounded _EVICTED) so its late on_stream_end can
+        # persist a telemetry-incomplete row WITHOUT firing a false
+        # empty_stream signal — see _EVICTED.
         if len(_STREAMS) > _STREAM_MAX:
             oldest = min(_STREAMS, key=lambda k: _STREAMS[k]["started"])
             _STREAMS.pop(oldest, None)
+            _EVICTED.add(oldest)
+            while len(_EVICTED) > max(16, _STREAM_MAX * 2):
+                _EVICTED.pop()
 
 
 def _on_stream_delta(
@@ -542,6 +831,44 @@ def _on_stream_delta(
             st["first_token_ms"] = int((time.time() - st["started"]) * 1000)
 
 
+def _session_activity_count(session_id: str) -> int:
+    """Return the number of activity rows for *session_id* in the last 24h.
+
+    Used by the empty-stream classifier to distinguish a transient provider
+    hiccup (low activity) from context-window exhaustion (a heavily-used
+    session that has run out of context). Fail-open: returns 0 on any
+    DB error so the signal still fires - just without the extra hint.
+    """
+    if not session_id:
+        return 0
+    try:
+        from __init__ import _get_activity_conn
+
+        # Timezone-aware cutoff: stored activity timestamps are local-time
+        # ISO strings (datetime.now().isoformat()), so the cutoff MUST be
+        # computed in Python the same way. Comparing against SQLite's
+        # datetime('now','-24 hours') (UTC, space separator) silently
+        # widened the window by the UTC offset + the 'T'-vs-' ' ordering,
+        # so sessions active 24-28h ago could trip the 3000-activity
+        # context-exhaustion hint despite being quiet in the real last 24h.
+        cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
+        _ensure_tables()
+        conn = _get_activity_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM activity "
+                "WHERE session_id = ? "
+                "AND timestamp >= ?",
+                (session_id, cutoff),
+            ).fetchone()
+            return int(row["c"]) if row else 0
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("session activity count failed for %s: %s", session_id, exc)
+        return 0
+
+
 def _on_stream_end(
     turn_id: str = "",
     session_id: str = "",
@@ -552,8 +879,12 @@ def _on_stream_end(
 ) -> None:
     """Persist aggregated stream stats and detect empty-stream failures."""
     key = (str(session_id or ""), str(turn_id or ""))
+    was_evicted = key in _EVICTED
+    if was_evicted:
+        _EVICTED.discard(key)
     with _STREAM_LOCK:
         st = _STREAMS.pop(key, None)
+        had_accumulator = st is not None
     if st is None:
         st = {
             "started": time.time(),
@@ -567,9 +898,19 @@ def _on_stream_end(
             "session_id": session_id or "",
             "turn_id": turn_id or "",
         }
+        # Late end for a stream whose accumulator was evicted at the cap:
+        # the end event is real, so persist the row — but flag the telemetry
+        # as incomplete and never claim the stream was 'empty' (we simply
+        # stopped tracking it; it may have streamed plenty of tokens).
+        st["evicted"] = was_evicted
     ended = time.time()
     duration_ms = int((ended - st["started"]) * 1000)
     error_text = str(error)[:400] if error else None
+    if not error_text and st.get("evicted"):
+        error_text = (
+            "accumulator evicted at stream cap (tracking limit) — "
+            "telemetry incomplete"
+        )
     _wave_insert(
         "streams",
         timestamp=datetime.now().isoformat(),
@@ -590,14 +931,73 @@ def _on_stream_end(
         duration_ms=duration_ms,
     )
     # Signal: a "successful" stream that produced zero tokens is a silent
-    # failure class traditional logging misses (Raindrop philosophy).
-    if SETTINGS.get("stream_signals", True) and finished and not error and st.get("chars", 0) == 0:
-        _wave_signal(
+    # failure class traditional logging misses (Raindrop philosophy). Only
+    # fire it when the stream was actually OBSERVED (its accumulator existed
+    # at on_stream_end): a late end for a cap-evicted / never-started stream
+    # has chars=0 only because tracking was lost, not because the provider
+    # returned nothing — claiming 'empty' there is a false positive that
+    # pollutes the Watch tab and pins the health score.
+    if (
+        SETTINGS.get("stream_signals", True)
+        and had_accumulator
+        and finished and not error
+        and st.get("chars", 0) == 0
+    ):
+        # Classify the root cause. In sessions with >3000 activities in 24h
+        # (e.g. 4042 in session 20260814_212312_f86a12), an empty stream is
+        # almost always context-window exhaustion rather than a transient
+        # provider error. Surface actionable guidance so the user knows to
+        # consolidate memory or start a fresh session.
+        hint = ""
+        if session_id:
+            _activity_count = _session_activity_count(session_id)
+            if _activity_count > 3000:
+                hint = (
+                    " LIKELY CONTEXT-WINDOW EXHAUSTION: this session has "
+                    f"{_activity_count} activities in 24h. Call memory "
+                    "consolidate or start a fresh session."
+                )
+        _wave_signal_coalesced(
             "empty_stream",
             "warning",
             "Empty LLM stream",
             "Streaming response finished with zero text tokens "
-            f"(session {str(session_id or '')[:8]}, turn {str(turn_id or '')[:8]}).",
+            f"(session {str(session_id or '')[:8]}, turn {str(turn_id or '')[:8]})."
+            + hint,
+            session_id or "",
+        )
+
+    # Signal: a stream that ENDED without finishing (finished=False) or with
+    # an explicit error is a truncated-response failure class nothing else
+    # surfaces. on_stream_end fired but reported the generation did not
+    # complete — the user sees a cut-off reply. stuck_stream owns the orphan
+    # case (end hook never fired), truncated_response owns finish_reason
+    # truncation at the API layer, and empty_stream owns zero-token NORMAL
+    # finishes; this closes the remaining hole: abnormal stream termination.
+    # Coalesced like empty_stream — a provider that drops every stream in a
+    # session must bump repeat_count, not flood the signal feed.
+    if SETTINGS.get("stream_signals", True) and (not finished or error):
+        if error:
+            _severity = "error"
+            _label = "Stream error"
+            _desc = (
+                f"Streaming response errored mid-generation "
+                f"(session {str(session_id or '')[:8]}, turn {str(turn_id or '')[:8]}): "
+                f"{error_text or 'unknown error'}"
+            )
+        else:
+            _severity = "warning"
+            _label = "Stream interrupted"
+            _desc = (
+                f"Streaming response ended before finishing "
+                f"(session {str(session_id or '')[:8]}, turn {str(turn_id or '')[:8]}), "
+                f"{st.get('chars', 0) if had_accumulator else '?'} chars streamed"
+            )
+        _wave_signal_coalesced(
+            "stream_interrupted",
+            _severity,
+            _label,
+            _desc,
             session_id or "",
         )
 
@@ -673,6 +1073,29 @@ def _on_post_api_request(
         where_args=[api_request_id or ""],
     )
 
+    # Signal: an API response truncated by the OUTPUT budget is a silent
+    # failure — the reply is cut off mid-generation and the agent continues
+    # unaware (Raindrop philosophy: the failures logs miss). finish_reason
+    # 'length'/'max_tokens' means max output tokens was hit; 'content_filter'
+    # means the provider vetoed part of the reply. Both degrade the response
+    # without raising an error, so traditional logging records nothing.
+    _finish_l = str(finish_reason or "").lower()
+    if _finish_l in ("length", "max_tokens", "content_filter"):
+        # Coalesced: a session pinned at its output budget (finish_reason
+        # 'length' every request) used to insert one signal ROW per request —
+        # the same flood class as empty_stream (see _wave_signal_coalesced).
+        # Per-request detail stays in api_requests; the signal tracks the
+        # first occurrence + repeat_count so health scoring stays honest.
+        _wave_signal_coalesced(
+            "truncated_response",
+            "warning",
+            f"Response truncated ({finish_reason})",
+            f"LLM finished with {finish_reason} on {model or 'unknown'} "
+            f"({provider or 'unknown'}) — reply incomplete"
+            + (f", {out_tokens} output tokens" if isinstance(out_tokens, int) else ""),
+            session_id or "",
+        )
+
 
 def _on_api_request_error(
     api_request_id: str = "",
@@ -706,7 +1129,12 @@ def _on_api_request_error(
         where_args=[api_request_id or ""],
     )
     severity = "warning" if retryable else "error"
-    _wave_signal(
+    # Coalesced: a provider outage / rate-limit storm retries every request,
+    # inserting N identical api_error ROWS per session (same flood class as
+    # empty_stream). Per-request detail stays in api_requests; the signal
+    # coalesces with repeat_count and ESCALATES severity if a later failure
+    # is worse (warning 429 storm -> hard error 500).
+    _wave_signal_coalesced(
         "api_error",
         severity,
         f"API error: {provider or 'unknown'} {status_code or ''}".strip(),
@@ -806,7 +1234,24 @@ def _on_post_approval_response(
     pattern_keys: Optional[list] = None,
     **_,
 ) -> None:
-    """Close the newest pending approval row; flag denials."""
+    """Close the matching pending approval row; flag denials.
+
+    Only the NEWEST pending row matching (session_key + optional pattern_key)
+    is closed — the old query updated EVERY pending row for the session_key,
+    so two outstanding approvals (parallel dangerous commands) had BOTH rows
+    overwritten with the same choice, corrupting the audit trail for the
+    command the user never actually saw. When pattern_key is available it
+    narrows the match to the intended approval; otherwise the newest pending
+    row for the session is the best available correlation.
+    """
+    _where = (
+        "id = (SELECT id FROM approvals WHERE choice = 'pending' AND session_key = ?"
+        + (" AND pattern_key = ?" if pattern_key else "")
+        + " ORDER BY id DESC LIMIT 1)"
+    )
+    _args = [str(session_key or "")]
+    if pattern_key:
+        _args.append(str(pattern_key))
     _wave_update(
         "approvals",
         {
@@ -814,8 +1259,8 @@ def _on_post_approval_response(
             "decided_by": str(decided_by or "")[:40],
             "decided_at": datetime.now().isoformat(),
         },
-        where="choice = 'pending' AND session_key = ?",
-        where_args=[str(session_key or "")],
+        where=_where,
+        where_args=_args,
     )
     if str(choice or "").lower() in ("deny", "timeout"):
         _wave_signal(
@@ -823,6 +1268,7 @@ def _on_post_approval_response(
             "warning",
             f"Approval {choice}",
             f"Dangerous command was {choice} (surface {surface or 'unknown'}).",
+            session_key or "",
         )
 
 
@@ -903,6 +1349,7 @@ def _on_unload() -> None:
     _CTX = None
     with _STREAM_LOCK:
         _STREAMS.clear()
+    _EVICTED.clear()
 
 
 def wave_register(ctx) -> None:
@@ -928,6 +1375,15 @@ def wave_register(ctx) -> None:
         stream_sig = ctx.get_config("stream_signals", SETTINGS.get("stream_signals"))
         if stream_sig is not None:
             SETTINGS["stream_signals"] = bool(stream_sig)
+    except Exception:
+        pass
+    try:
+        coalesce = ctx.get_config(
+            "stream_signal_coalesce_minutes",
+            SETTINGS.get("stream_signal_coalesce_minutes"),
+        )
+        if coalesce is not None:
+            SETTINGS["stream_signal_coalesce_minutes"] = int(coalesce)
     except Exception:
         pass
 

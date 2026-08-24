@@ -48,6 +48,28 @@ _PLUGIN_ROOT = str(Path(__file__).resolve().parent)
 if _PLUGIN_ROOT not in sys.path:
     sys.path.insert(0, _PLUGIN_ROOT)
 
+# ---------------------------------------------------------------------------
+# SRP module re-exports (Clean Architecture extraction). Each module is
+# self-contained and imports the core lazily inside functions (see
+# abyss_wave.py) — these imports keep the public surface of this module
+# exactly as before for tests, plugin_api.py and the dashboard.
+# ---------------------------------------------------------------------------
+from abyss_signals import _SIGNAL_PATTERNS, _detect_signals  # noqa: E402,F401
+from abyss_analytics import get_health, get_trends, get_failures, export_data, get_status, get_performance  # noqa: E402,F401
+from abyss_incidents import _SEVERITY_RANK, _acknowledge_signal, _resolve_signal, _resolve_signals_bulk, _update_incident_status, _cluster_incidents  # noqa: E402,F401
+from abyss_agent import (  # noqa: E402,F401
+    _redact, _resolve_agent_cmd, _prune_resolutions, _spawn_agent,
+    _AGENT_PROCS, _prune_agent_procs, _cleanup_agent_procs,
+    _read_report_file, _write_report_file, _mark_resolution,
+    _resolution_context, _build_resolver_prompt, _resolution_finalize,
+    _resolution_worker, _dispatch_resolution,
+)
+from abyss_doctor import (  # noqa: E402,F401
+    _doctor_context, _doctor_worker, _dispatch_doctor, _doctor_report,
+    _doctor_log,
+    _run_benchmark, _doctor_last, _doctor_apply_worker, _dispatch_doctor_apply,
+)
+
 # Hermes profile home
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 PROFILE_HOME = os.environ.get("HERMES_PROFILE_HOME", HERMES_HOME)
@@ -63,6 +85,19 @@ logger = logging.getLogger("hermes.plugins.abyss")
 
 # Thread lock for DB writes
 _lock = threading.Lock()
+
+# One-time schema bootstrap guard. _init_db() is called from EVERY hook handler
+# and every _add_activity/_add_trace/_record_signals (the hot path), and each
+# call opens 4 sqlite connections and runs ~15 CREATE TABLE/INDEX + PRAGMA
+# statements. DDL takes SQLite schema locks, so this redundant per-event work
+# is a direct contributor to the cross-process 'database is locked' WAL
+# collisions abyss_wave._wave_with_retry exists to survive. Memoize after the
+# first SUCCESSFUL init: PLUGIN_DATA is an import-time constant so the schema
+# cannot move mid-process, and reset_db() only DELETEs rows (never drops
+# tables or files). If init raises, the flag stays unset and the next caller
+# retries the full bootstrap.
+_DB_READY = False
+_DB_INIT_LOCK = threading.Lock()
 
 
 def _get_activity_conn():
@@ -114,7 +149,25 @@ def _migrate_schema(conn):
 
 
 def _init_db():
-    """Initialize databases if not exists."""
+    """Initialize databases if not exists (memoized after first success).
+
+    The recording hot path (every hook event) calls _init_db(); after the
+    first successful bootstrap this returns immediately without touching
+    SQLite, eliminating ~12 connection opens + ~45 DDL statements per event
+    (DDL schema locks were a contributor to 'database is locked' WAL races).
+    """
+    global _DB_READY
+    if _DB_READY:
+        return
+    with _DB_INIT_LOCK:
+        if _DB_READY:
+            return
+        _init_db_unlocked()
+        _DB_READY = True
+
+
+def _init_db_unlocked():
+    """Run the actual schema bootstrap. Caller must hold _DB_INIT_LOCK."""
     conn = _get_activity_conn()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS activity (
@@ -134,7 +187,6 @@ def _init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_cat ON activity(category)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_session ON activity(session_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_tool ON activity(tool_name)")
-    _migrate_schema(conn)
     conn.commit()
 
     # Trace DB for conversation timelines
@@ -205,6 +257,15 @@ def _init_db():
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_incidents_ts ON incidents(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status)")
+
+    # Migrate AFTER signals/incidents exist. _migrate_schema uses ALTER TABLE,
+    # which fails on a not-yet-created table — running it before the signals/
+    # incidents CREATE TABLE statements means every column it adds (details,
+    # incident_id, acknowledged_at, resolved_at, resolution_*) is silently
+    # skipped on first init. The legacy code masked this by calling _init_db()
+    # on every write (the second call migrated the now-existing tables); the
+    # memoized single-init requires the correct order.
+    _migrate_schema(conn)
 
     # Wave tables — August 2026 plugin-interface expansion (#64182)
     try:
@@ -297,6 +358,22 @@ def _add_trace(
 # Hook handlers
 # ---------------------------------------------------------------------------
 
+def _safe_str_preview(value: Any, limit: int = 200) -> str:
+    """Best-effort string preview of a hook payload value.
+
+    ``str()`` on an arbitrary tool/LLM result can itself raise (an object
+    whose ``__repr__``/``__str__`` blows up, e.g. on a lazy/partially
+    destructured response). A hook callback must never raise into the host,
+    so fall back to a type label instead of letting the exception escape.
+    """
+    if not value:
+        return ""
+    try:
+        return str(value)[:limit]
+    except Exception as exc:
+        return f"<unserializable {type(value).__name__}: {exc!r}>"
+
+
 def _on_pre_tool_call(
     tool_name: str = "",
     args: Optional[Dict[str, Any]] = None,
@@ -345,7 +422,7 @@ def _on_post_tool_call(
     fields — we use them for signal detection instead of only grepping text.
     """
     _init_db()
-    result_preview = str(result)[:200] if result else ""
+    result_preview = _safe_str_preview(result)
     ok = (status or "ok") != "error"
     _add_trace(
         session_id=session_id,
@@ -436,7 +513,7 @@ def _on_post_llm_call(
     Real ``post_llm_call`` payload carries ``assistant_response`` (not ``result``).
     """
     _init_db()
-    result_preview = str(assistant_response)[:200] if assistant_response else ""
+    result_preview = _safe_str_preview(assistant_response)
     activity_result = _add_activity(
         action="llm_call_completed",
         description=f"Completed {model}",
@@ -479,7 +556,7 @@ def _on_session_start(
     _init_db()
     _add_activity(
         action="session_started",
-        description=f"Session {session_id[:8]} started via {source}",
+        description=f"Session {str(session_id or '')[:8]} started via {source}",
         category="session",
         status="running",
         metadata={"source": source},
@@ -502,7 +579,7 @@ def _on_session_end(
     _init_db()
     _add_activity(
         action="session_ended",
-        description=f"Session {session_id[:8]} {'completed' if completed else 'interrupted'}",
+        description=f"Session {str(session_id or '')[:8]} {'completed' if completed else 'interrupted'}",
         category="session",
         status="completed",
         metadata={"completed": completed, "interrupted": interrupted},
@@ -518,181 +595,7 @@ def _on_session_end(
 # ---------------------------------------------------------------------------
 # Raindrop-style observability: signals, incidents, self-diagnostics
 # ---------------------------------------------------------------------------
-
-# Failure patterns that Raindrop detects — these are the "silent agent failures"
-# that traditional logging misses (per Raindrop docs: silent tool errors,
-# "forgetting", vague replies, persona drift, hallucinations, loops).
-_SIGNAL_PATTERNS = [
-    ("tool_error",      "error",  "error",   "Tool call failed with an error"),
-    ("timeout",         "timeout", "warning", "Tool call or operation timed out"),
-    ("rate_limit",      "rate_limit", "warning", "API rate limit hit"),
-    ("loop_detected",   "loop",   "error",   "Agent appears to be in a loop"),
-    ("vague_reply",     "vague",  "warning", "LLM response was vague or unhelpful"),
-    ("drift_detected",  "drift",  "warning", "Potential persona drift detected"),
-    ("context_loss",    "context", "error",  "Context may have been lost between turns"),
-]
-
-
-def _detect_signals(
-    tool_name: str,
-    result: Any,
-    session_id: str,
-    status: str,
-    activity_id: int,
-    error_type: str = "",
-    error_message: str = "",
-    duration_ms: int = 0,
-) -> list:
-    """Run Raindrop-style signal classifiers on a tool call result.
-
-    Returns a list of detected signals. Each signal is dict with:
-    signal_type, severity, label, description, details.
-
-    Detection logic:
-    1. Error-based: structured ``status == error`` / ``error_type`` set, or
-       result text contains error-like keywords
-    2. Timeout-based: structured ``error_type`` mentions timeout, or result text
-    3. Rate limit: structured ``error_type`` mentions rate/429, or result text
-    4. Slow call: structured ``duration_ms`` above threshold (60s)
-    5. Loop detection: same tool called with identical args in same session
-    6. Vague reply: LLM response very short or refusal-like
-    """
-    signals = []
-    result_str = str(result).lower() if result else ""
-    err_type_l = (error_type or "").lower()
-    err_msg_l = (error_message or "").lower()
-    already: set = set()
-
-    # 1b. Benign read_file error suppression (computed before signal detection)
-    # "File not found" is an agent's normal exploratory path probing (e.g.
-    # probing for config/README/etc.) and not a backend fault. "Access denied:
-    # ...credential store" is an intentional defense-in-depth gate, not a real
-    # failure. Both flood the signal firehose with tool_error signals; suppress
-    # them. Genuine permission errors on real files still classify normally.
-    _SUPPRESS_TOOL_ERROR = False
-    if tool_name == "read_file" and status == "error":
-        _rf_low = err_msg_l + result_str
-        if "file not found" in _rf_low or ("access denied" in _rf_low and "credential store" in _rf_low):
-            _SUPPRESS_TOOL_ERROR = True
-
-    def _add(signal_type, severity, label, description, details=None):
-        if signal_type in already:
-            return
-        already.add(signal_type)
-        signals.append({
-            "signal_type": signal_type,
-            "severity": severity,
-            "label": label,
-            "description": description,
-            "details": details or {},
-        })
-
-    # 0. Exit-code classification. A bare "exit N" error_message carries no
-    # diagnostic value yet currently triple-fires (tool_error + timeout +
-    # slow_call for exit 124). Map the known codes to a single cause so each
-    # event yields exactly one correctly-typed signal.
-    _exit_match = re.match(r"^exit (-?\d+)$", (error_message or "").strip())
-    _exit_cause = ({"124": "timeout", "127": "command-not-found",
-                    "137": "killed", "-1": "killed", "-9": "killed"}.get(_exit_match.group(1))
-                   if _exit_match else None)
-
-    # 1. Error detection (structured only). The old text fallback scanned
-    # result text on COMPLETED calls for error-like keywords ("error:",
-    # "traceback", "*Error" class names) and fired ~127 false tool_error
-    # signals on successful calls whose output merely mentioned an error
-    # (grep results, build logs, read-file contents, memory entries). Real
-    # tool failures always arrive with status=="error" or a structured
-    # error_type, so the fallback was pure false-positive noise and is
-    # removed. The read_file suppression above now fully silences tool_error.
-    if _exit_cause == "timeout":
-        pass  # exit 124 is a timeout kill; the timeout branch below owns it
-    elif (not _SUPPRESS_TOOL_ERROR) and (status == "error" or err_type_l or "error" in err_type_l):
-        if error_message:
-            desc = f"Tool '{tool_name}' failed: {error_message[:200]}"
-        else:
-            desc = f"Tool '{tool_name}' failed with an error state"
-        details = {"error_type": error_type, "error_message": error_message}
-        if _exit_match:
-            details["exit_code"] = _exit_match.group(1)
-        # Bare exit codes are downgraded to warning: no diagnostic value.
-        _add("tool_error", "warning" if _exit_match else "error", "Tool Error", desc, details)
-
-    # 2. Timeout detection
-    # Structured fields first; the result-text fallback requires a strong
-    # tool-generated signature. A bare "timed out" substring in free text
-    # (a page the agent merely read, log prose) is not evidence the tool call
-    # itself timed out and flooded the feed with false positives.
-    if _exit_cause == "timeout" or "timeout" in err_type_l or "timeout" in err_msg_l or "timed out" in err_msg_l \
-            or "timeout error" in result_str or "operation timed out" in result_str:
-        _add("timeout", "warning", "Timeout",
-             f"Tool '{tool_name}' operation timed out",
-             {"error_type": error_type, "error_message": error_message})
-
-    # 3. Rate limit detection (structured evidence only).
-    # Result-text scanning fired on benign content: 29/37 unresolved
-    # rate_limit signals sat on COMPLETED calls with empty structured fields
-    # (a read_file of a file that merely mentions "rate"/"quota", memory
-    # entries containing "rate"). A rate limit is a backend error and always
-    # arrives via error_type/error_message. Keep only the unambiguous
-    # "429"/"too many requests" result tokens, restricted to failed calls.
-    _RATE_LIMIT_TOKENS = ("429", "too many requests")
-    _CREDIT_TOKENS = ("credit", "balance", "exhausted", "payment required",
-                      "402", "quota", "insufficient")
-    if any(tok in err_msg_l for tok in _RATE_LIMIT_TOKENS) \
-            or ("429" in err_type_l or "too many requests" in err_type_l) \
-            or (status == "error" and any(tok in result_str for tok in _RATE_LIMIT_TOKENS)) \
-            or any(tok in err_msg_l for tok in _CREDIT_TOKENS) \
-            or any(tok in err_type_l for tok in _CREDIT_TOKENS):
-        _add("rate_limit", "warning", "Rate Limit",
-             f"API rate limit hit during '{tool_name}'",
-             {"error_type": error_type, "error_message": error_message})
-
-    # 4. Slow call detection (structured duration)
-    if duration_ms and duration_ms > 60000 and _exit_cause != "timeout":
-        # A timeout-killed call's duration IS the timeout, not a slow call.
-        _add("slow_call", "info", "Slow Call",
-             f"Tool '{tool_name}' took {duration_ms / 1000:.1f}s (>60s)",
-             {"duration_ms": duration_ms})
-
-    # 5. Loop detection: check if same tool called with same args recently
-    if tool_name and session_id:
-        conn = _get_activity_conn()
-        try:
-            recent = conn.execute(
-                """SELECT tool_name, args, timestamp FROM activity
-                   WHERE session_id = ? AND tool_name = ? AND id != ?
-                   ORDER BY timestamp DESC LIMIT 3""",
-                (session_id, tool_name, activity_id)
-            ).fetchall()
-            if len(recent) >= 2:
-                # If same tool called 3+ times in same session with similar args = loop
-                args_list = [r["args"] for r in recent]
-                if len(set(args_list)) == 1:
-                    _add("loop_detected", "error", "Agent Loop",
-                         f"Tool '{tool_name}' called {len(recent)+1}x with identical args in same session")
-        except sqlite3.Error:
-            pass
-        finally:
-            conn.close()
-
-    # 6. Vague/empty reply detection for LLM results
-    if tool_name in ("llm_call_completed",) or "llm" in str(tool_name).lower():
-        result_clean = result_str.strip().strip('"\'` \n\r\t').strip()
-        if result_clean:
-            if len(result_clean) < 20 and not result_clean.endswith(('.', '!', '?')):
-                _add("vague_reply", "warning", "Vague Reply",
-                     f"LLM response appears too short or vague ({len(result_clean)} chars)")
-            elif any(token in result_clean for token in (
-                "i don't know", "i cannot", "i can't", "not sure how", "unable to",
-                "i am not able", "sorry, i can't", "i'm sorry, but i can't",
-            )):
-                _add("refusal", "warning", "LLM Refusal",
-                     f"LLM response contains a refusal/unable pattern")
-        elif status == "error":
-            _add("empty_result", "warning", "Empty Result",
-                 f"Tool '{tool_name}' returned no result with error status")
-
-    return signals
+# (_SIGNAL_PATTERNS + _detect_signals extracted to abyss_signals.py)
 
 
 def _record_signals(signals: list, session_id: str, activity_id: int) -> list:
@@ -751,24 +654,31 @@ def _detect_and_record_signals(
     duration_ms: int = 0,
 ):
     """Run signal detection and persist any found signals."""
-    signals = _detect_signals(
-        tool_name, result, session_id, status, activity_id,
-        error_type=error_type, error_message=error_message, duration_ms=duration_ms,
-    )
-    if signals:
-        _record_signals(signals, session_id, activity_id)
-        # Also update activity with signal flag
-        conn = _get_activity_conn()
-        try:
-            conn.execute(
-                "UPDATE activity SET metadata = json_patch(COALESCE(metadata, '{}'), '{\"has_signals\": true}') WHERE id = ?",
-                (activity_id,)
-            )
-            conn.commit()
-        except Exception:
-            pass
-        finally:
-            conn.close()
+    # Fail-open guard (#night-shift): signal detection must never raise out of
+    # a hook callback into the host. _add_activity/_add_trace already swallow
+    # their own DB errors; detection/classification gets the same treatment.
+    try:
+        signals = _detect_signals(
+            tool_name, result, session_id, status, activity_id,
+            error_type=error_type, error_message=error_message, duration_ms=duration_ms,
+        )
+        if signals:
+            _record_signals(signals, session_id, activity_id)
+            # Also update activity with signal flag
+            conn = _get_activity_conn()
+            try:
+                conn.execute(
+                    "UPDATE activity SET metadata = json_patch(COALESCE(metadata, '{}'), '{\"has_signals\": true}') WHERE id = ?",
+                    (activity_id,)
+                )
+                conn.commit()
+            except Exception:
+                pass
+            finally:
+                conn.close()
+    except Exception as exc:
+        logger.debug("Abyss signal detection failed (ignored): %s", exc)
+        signals = []
 
     # NoneType terminal command backoff guard
     # The LLM sometimes emits a terminal tool call with command=None
@@ -849,1050 +759,53 @@ def _record_self_diagnostic(
 
 # ---------------------------------------------------------------------------
 # Triage helpers — acknowledge / resolve signals and incidents
+# (_SEVERITY_RANK + triage trio extracted to abyss_incidents.py)
 # ---------------------------------------------------------------------------
 
-_SEVERITY_RANK = {"critical": 4, "error": 3, "warning": 2, "info": 1}
-
-
-def _acknowledge_signal(signal_id: int, note: str = "") -> Optional[dict]:
-    """Mark a signal acknowledged. Returns the updated row or None."""
-    _init_db()
-    conn = _get_activity_conn()
-    try:
-        conn.execute(
-            "UPDATE signals SET acknowledged = 1, acknowledged_at = ? WHERE id = ?",
-            (datetime.now().isoformat(), signal_id),
-        )
-        conn.commit()
-        row = conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone()
-        return dict(row) if row else None
-    except sqlite3.Error as e:
-        logger.error("Failed to acknowledge signal %s: %s", signal_id, e)
-        return None
-    finally:
-        conn.close()
-
-
-def _resolve_signal(signal_id: int, note: str = "") -> Optional[dict]:
-    """Mark a signal resolved (also acknowledged). Returns the updated row."""
-    _init_db()
-    now = datetime.now().isoformat()
-    conn = _get_activity_conn()
-    try:
-        conn.execute(
-            "UPDATE signals SET acknowledged = 1, resolved = 1, acknowledged_at = ?, resolved_at = ? WHERE id = ?",
-            (now, now, signal_id),
-        )
-        conn.commit()
-        row = conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone()
-        return dict(row) if row else None
-    except sqlite3.Error as e:
-        logger.error("Failed to resolve signal %s: %s", signal_id, e)
-        return None
-    finally:
-        conn.close()
-
-
-def _update_incident_status(incident_id: int, status: str) -> Optional[dict]:
-    """Transition an incident to a new status (open/acknowledged/resolved/closed).
-
-    When resolved/closed, also resolves all linked open signals.
-    """
-    valid = {"open", "acknowledged", "resolved", "closed"}
-    if status not in valid:
-        return None
-    _init_db()
-    conn = _get_activity_conn()
-    try:
-        conn.execute(
-            "UPDATE incidents SET status = ?, resolved_at = ? WHERE id = ?",
-            (status, datetime.now().isoformat() if status in ("resolved", "closed") else None, incident_id),
-        )
-        if status in ("resolved", "closed"):
-            conn.execute(
-                "UPDATE signals SET resolved = 1, acknowledged = 1 WHERE incident_id = ?",
-                (incident_id,),
-            )
-        conn.commit()
-        row = conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
-        return dict(row) if row else None
-    except sqlite3.Error as e:
-        logger.error("Failed to update incident %s: %s", incident_id, e)
-        return None
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Agent-powered resolution — spawn a free-Nous Hermes agent to diagnose + fix
-# ---------------------------------------------------------------------------
-#
-# The "resolve" buttons in the desktop UI now dispatch a real agent instead
-# of just flipping a DB flag. An independent `hermes chat -q` process runs as
-# the same profile (default free Nous model), loads the `abyss-doctor` skill,
-# diagnoses the root cause, fixes it on the backend, and writes a JSON report.
-# A background thread watches the report and only then marks the
-# signal/incident resolved (or failed, so the user can retry).
 
 _RESOLUTION_DIR = PLUGIN_DATA / "resolutions"
 _RESOLUTION_DIR.mkdir(parents=True, exist_ok=True)
 
 _AGENT_DEFAULT_TIMEOUT = int(os.environ.get("ABYSS_AGENT_TIMEOUT", "1200") or 1200)
 
+# ---------------------------------------------------------------------------
+# Agent-powered resolution: _redact, _resolve_agent_cmd, _prune_resolutions,
+# _spawn_agent, _AGENT_PROCS registry + cleanup, report IO, _mark_resolution,
+# _resolution_context/_build_resolver_prompt/_resolution_finalize/_resolution_worker,
+# _dispatch_resolution — extracted to abyss_agent.py
+# ---------------------------------------------------------------------------
 
-def _redact(value: Any, limit: int = 200) -> Any:
-    """Redact secret-looking keys and truncate long values before embedding
-    tool arguments / error payloads into an agent prompt."""
-    if isinstance(value, dict):
-        out = {}
-        for k, v in value.items():
-            kl = str(k).lower()
-            if any(t in kl for t in ("token", "secret", "password", "api_key", "apikey", "authorization", "auth")):
-                out[k] = "***"
-            else:
-                out[k] = _redact(v, limit)
-        return out
-    if isinstance(value, (list, tuple)):
-        return [_redact(v, limit) for v in value[:20]]
-    if value is None:
-        return None
-    s = str(value)
-    return s if len(s) <= limit else s[:limit] + "…"
-
-
-def _resolve_agent_cmd(prompt: str) -> list:
-    """Build the command list that runs the Abyss agent.
-
-    Honors the ``ABYSS_AGENT_CMD`` override (either a JSON list of argv or a
-    shlex string; the prompt is placed after ``-q`` if present, else appended)
-    — used by the test suites to stub the agent. The default is the `hermes`
-    CLI with the abyss-doctor skill preloaded and quiet mode, so it runs as
-    the same profile (free Nous model by default).
-    """
-    override = os.environ.get("ABYSS_AGENT_CMD", "").strip()
-    if override:
-        argv = None
-        if override.startswith("["):
-            try:
-                argv = json.loads(override)
-            except (ValueError, TypeError):
-                argv = None
-        if argv is None:
-            argv = shlex.split(override)
-        if "-q" in argv:
-            idx = argv.index("-q")
-            # Only replace the arg AFTER -q when it is actually the prompt;
-            # -q at the end (or followed by another flag) appends instead of
-            # crashing with IndexError or clobbering the flag.
-            if idx + 1 < len(argv) and not argv[idx + 1].startswith("-"):
-                argv[idx + 1] = prompt
-            else:
-                argv.append(prompt)
-        else:
-            argv.append(prompt)
-        return argv
-
-    exe = shutil.which("hermes")
-    if not exe:
-        candidates = [
-            Path(HERMES_HOME) / "hermes-agent" / "venv" / "Scripts" / "hermes.exe",
-            Path(HERMES_HOME) / "hermes-agent" / "venv" / "bin" / "hermes",
-            Path(HERMES_HOME) / "bin" / "hermes",
-        ]
-        exe = next((str(c) for c in candidates if Path(c).exists()), None)
-    if not exe:
-        raise RuntimeError("hermes CLI not found; set ABYSS_AGENT_CMD to the agent command")
-    # --max-turns 300: dispatched agents routinely die at the default 60-turn
-    # cap before finishing multi-fix apply runs (observed: "2/8 applied" twice
-    # because the agent hit "Reached maximum iterations (60)"). The prompts
-    # time-box investigation, so a larger budget cannot spin forever.
-    return [exe, "chat", "-q", prompt, "-s", "abyss-doctor", "-Q", "--max-turns", "300"]
-
-
-def _prune_resolutions(retention_days: int = 30, keep_recent: int = 20, safety_hours: int = 1) -> dict:
-    """Hygiene: bound the resolutions dir.
-
-    Deletes resolution ``.json``/``.log`` pairs older than ``retention_days``,
-    keeping at least the newest ``keep_recent`` per kind (doctor-/signal-/
-    incident-/other-). Never touches files modified within ``safety_hours``
-    (an active run is being written) or reports still in an
-    in_progress/running state (the UI/worker polls those).
-    """
-    deleted = 0
-    if not _RESOLUTION_DIR.exists():
-        return {"deleted": 0}
-    cutoff = time.time() - retention_days * 86400
-    safety = time.time() - safety_hours * 3600
-    by_kind: dict = {}
-    for f in _RESOLUTION_DIR.glob("*.json"):
-        kind = f.stem.split("-")[0] if "-" in f.stem else "other"
-        by_kind.setdefault(kind, []).append(f)
-    for kind, files in by_kind.items():
-        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        for i, f in enumerate(files):
-            try:
-                mtime = f.stat().st_mtime
-            except OSError:
-                continue
-            if mtime >= cutoff or mtime > safety or i < keep_recent:
-                continue
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and data.get("status") in ("in_progress", "running"):
-                    continue
-            except Exception:
-                pass
-            for ext in (".json", ".log"):
-                try:
-                    (f.parent / (f.stem + ext)).unlink()
-                    deleted += 1
-                except OSError:
-                    pass
-    return {"deleted": deleted}
-
-
-def _spawn_agent(prompt: str, report_path: Path, role: str = "resolver") -> "subprocess.Popen":
-    """Spawn the Abyss agent as an independent, background `hermes` process.
-
-    The child inherits this process's HERMES_HOME / HERMES_PROFILE_HOME so it
-    runs as the same profile (free Nous model) and loads the same skills. The
-    report path is passed via ``ABYSS_REPORT_PATH`` and stdout/stderr are
-    captured to a sibling ``.log`` file (no console window on Windows).
-
-    Every spawned child is registered in ``_AGENT_PROCS`` and terminated by an
-    atexit hook if this process exits while the child is still alive — a
-    dispatched agent must NEVER outlive its backend (stray agents hold file
-    handles on the install and block Hermes self-updates).
-    """
-    cmd = _resolve_agent_cmd(prompt)
-    env = os.environ.copy()
-    env["HERMES_HOME"] = str(HERMES_HOME)
-    env["HERMES_PROFILE_HOME"] = str(PROFILE_HOME)
-    env["ABYSS_REPORT_PATH"] = str(report_path)
-    env["ABYSS_AGENT_ROLE"] = role
-    env["PYTHONUNBUFFERED"] = "1"
-    log_path = report_path.with_suffix(".log")
-    logf = open(log_path, "wb", buffering=0)
-    kwargs = {
-        "stdout": logf,
-        "stderr": subprocess.STDOUT,
-        "env": env,
-        "cwd": str(PROFILE_HOME),
-    }
-    if os.name == "nt":
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    _prune_agent_procs()  # drop finished children first (never grows unbounded)
-    try:
-        _prune_resolutions()  # lazy hygiene: bound the resolutions dir on activity
-    except Exception:
-        pass
-    try:
-        proc = subprocess.Popen(cmd, **kwargs)
-    except Exception:
-        # Never leak the open .log handle (it holds a file lock on Windows).
-        try:
-            logf.close()
-        except Exception:
-            pass
-        raise
-    _AGENT_PROCS.add(proc)
-    return proc
-
-
-# Registry of live dispatched agents + cleanup on process exit. A child that
-# outlives the backend (backend killed, test run aborted) lingers holding file
-# handles on the install — the Hermes updater then refuses to run ("another
-# Hermes process is using this installation"). Kill survivors on exit.
-# Finished children are PRUNED on every spawn so the registry (and each
-# child's open .log stream) cannot accumulate for the backend's lifetime.
-_AGENT_PROCS: set = set()
-
-
-def _prune_agent_procs() -> None:
-    for proc in list(_AGENT_PROCS):
-        if proc.poll() is not None:  # finished — release its .log stream handle
-            try:
-                if getattr(proc, "stdout", None) is not None:
-                    proc.stdout.close()
-            except Exception:
-                pass
-            _AGENT_PROCS.discard(proc)
-
-
-def _cleanup_agent_procs() -> None:
-    for proc in list(_AGENT_PROCS):
-        if proc.poll() is None:  # still running
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-    _AGENT_PROCS.clear()
-
-
-import atexit as _atexit  # noqa: E402
-_atexit.register(_cleanup_agent_procs)
-
-
-def _read_report_file(report_path: Path) -> Optional[dict]:
-    try:
-        data = json.loads(report_path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-def _write_report_file(report_path: Path, report: dict) -> None:
-    try:
-        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    except Exception as exc:
-        logger.error("Abyss: failed to write report %s: %s", report_path, exc)
-
-
-def _mark_resolution(kind: str, obj_id: int, status: str, note: str = "") -> None:
-    """Record the outcome of an agent resolution run on a signal/incident.
-
-    ``status == "succeeded"`` also resolves the object (and, for incidents,
-    every linked signal); ``failed`` leaves it open so the user can retry.
-    """
-    _init_db()
-    now = datetime.now().isoformat()
-    note = (note or "")[:2000]
-    conn = _get_activity_conn()
-    try:
-        if kind == "signals":
-            conn.execute(
-                """UPDATE signals SET resolution_status = ?, resolution_note = ?,
-                       resolution_finished_at = ?, resolved = ?, acknowledged = 1, resolved_at = ?
-                   WHERE id = ?""",
-                (status, note, now, 1 if status == "succeeded" else 0,
-                 now if status == "succeeded" else None, obj_id),
-            )
-        else:
-            conn.execute(
-                """UPDATE incidents SET resolution_status = ?, resolution_note = ?,
-                       resolution_finished_at = ?, status = ?, resolved_at = ?
-                   WHERE id = ?""",
-                (status, note, now,
-                 "resolved" if status == "succeeded" else "open",
-                 now if status == "succeeded" else None, obj_id),
-            )
-            if status == "succeeded":
-                conn.execute(
-                    "UPDATE signals SET resolved = 1, acknowledged = 1, resolved_at = ? WHERE incident_id = ?",
-                    (now, obj_id),
-                )
-        conn.commit()
-    except sqlite3.Error as exc:
-        logger.error("Failed to mark resolution %s %s: %s", kind, obj_id, exc)
-    finally:
-        conn.close()
-
-
-def _resolution_context(kind: str, row: dict) -> dict:
-    """Build the evidence context handed to the resolver agent."""
-    _init_db()
-    conn = _get_activity_conn()
-    try:
-        ctx = {"kind": kind, "id": row["id"]}
-        if kind == "signals":
-            ctx["signal"] = _redact(dict(row))
-            linked = None
-            if row.get("activity_id"):
-                linked = conn.execute("SELECT * FROM activity WHERE id = ?", (row["activity_id"],)).fetchone()
-            ctx["linked_activity"] = _redact(dict(linked)) if linked else None
-            errs = conn.execute(
-                """SELECT id, timestamp, action, tool_name, status, metadata
-                   FROM activity WHERE session_id = ? AND status = 'error'
-                   ORDER BY timestamp DESC LIMIT 8""",
-                (row.get("session_id") or "",),
-            ).fetchall()
-            ctx["session_errors"] = [_redact(dict(r)) for r in errs]
-        else:
-            ctx["incident"] = _redact(dict(row))
-            sig_ids = []
-            try:
-                sig_ids = json.loads(row.get("signal_ids") or "[]")
-            except (ValueError, TypeError):
-                sig_ids = []
-            sigs = []
-            if sig_ids:
-                placeholders = ",".join("?" for _ in sig_ids)
-                sigs = conn.execute(
-                    f"SELECT * FROM signals WHERE id IN ({placeholders}) ORDER BY timestamp DESC LIMIT 30",
-                    sig_ids,
-                ).fetchall()
-            ctx["linked_signals"] = [_redact(dict(s)) for s in sigs]
-            sessions = []
-            for s in sigs[:10]:
-                sid = s["session_id"]
-                if sid and sid not in sessions:
-                    sessions.append(sid)
-            errs = []
-            for sid in sessions[:3]:
-                errs.extend(conn.execute(
-                    """SELECT id, timestamp, action, tool_name, status, metadata
-                       FROM activity WHERE session_id = ? AND status = 'error'
-                       ORDER BY timestamp DESC LIMIT 5""",
-                    (sid,),
-                ).fetchall())
-            ctx["session_errors"] = [_redact(dict(r)) for r in errs[:15]]
-        return ctx
-    finally:
-        conn.close()
-
-
-def _build_resolver_prompt(kind: str, row: dict, context: dict, report_path: Path) -> str:
-    ctx_json = json.dumps(context, indent=2)[:20000]
-    kind_label = "signal" if kind == "signals" else "incident"
-    return (
-        "You are the Abyss resolver: an autonomous Hermes agent that diagnoses and FIXES "
-        "agent-observability issues detected by the Abyss plugin.\n\n"
-        "Load the 'abyss-doctor' skill and follow it exactly.\n\n"
-        f"OBSERVED {kind_label.upper()} CONTEXT (JSON):\n{ctx_json}\n\n"
-        "TASK:\n"
-        "1. Diagnose the root cause from the context AND the live system. You have full "
-        "tool access: read files, inspect HERMES_HOME logs, check processes, edit configs "
-        "and plugin code.\n"
-        "2. Actually FIX the root cause on the backend — do not only describe it.\n"
-        "3. If the fix is reusable, save a skill named abyss-fix-<pattern> documenting it.\n"
-        "4. Write your report to ABYSS_REPORT_PATH as JSON with this exact schema:\n"
-        '{"schema":"abyss-resolution/1","role":"resolver","report_id":"' + report_path.stem + '",'
-        '"status":"succeeded|failed","summary":"one-line summary",'
-        '"findings":[{"title":"...","detail":"...","evidence":"..."}],'
-        '"actions_taken":["..."],"skills_saved":["..."],"error":null}\n'
-        "5. Your final chat response must be the one-line summary of what you fixed.\n"
-        "6. TIME-BOX: spend at most ~8 tool actions on investigation. If you cannot "
-        "reach a verified fix, write a PARTIAL report with status 'failed' and your "
-        "findings so far — do not keep investigating forever.\n"
-        "Do NOT mark anything resolved yourself — the backend does that from your report."
-    )
-
-
-def _resolution_finalize(kind: str, obj_id: int, report_path: Path, report: Optional[dict]) -> None:
-    ok = bool(report and report.get("status") == "succeeded")
-    note = (report or {}).get("summary") or (report or {}).get("error") or "agent completed"
-    _mark_resolution(kind, obj_id, "succeeded" if ok else "failed", note)
-    _add_activity(
-        action="resolution_completed" if ok else "resolution_failed",
-        description=f"Agent {'resolved' if ok else 'failed to resolve'} {kind[:-1]} {obj_id}: {note[:120]}",
-        category="system",
-        status="completed" if ok else "error",
-        metadata={"kind": kind, "obj_id": obj_id, "note": note[:500], "report": str(report_path)},
-    )
-
-
-def _resolution_worker(kind: str, obj_id: int, report_path: Path, prompt: str) -> None:
-    """Background thread: run the resolver agent, then finalize from its report."""
-    timeout_s = _AGENT_DEFAULT_TIMEOUT
-    try:
-        proc = _spawn_agent(prompt, report_path, role="resolver")
-    except Exception as exc:
-        logger.error("Abyss resolver spawn failed: %s", exc)
-        _mark_resolution(kind, obj_id, "failed", f"agent spawn failed: {exc}")
-        return
-    deadline = time.time() + timeout_s
-    report = None
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            report = _read_report_file(report_path)
-            if report is not None:
-                break
-            try:
-                log_tail = report_path.with_suffix(".log").read_text(encoding="utf-8", errors="replace")[-1500:]
-            except Exception:
-                log_tail = ""
-            report = {
-                "schema": "abyss-resolution/1", "role": "resolver", "status": "failed",
-                "summary": f"agent exited without report (code {proc.returncode})",
-                "error": log_tail[-500:],
-            }
-            break
-        report = _read_report_file(report_path)
-        # Only a TERMINAL report ends the wait while the agent still runs —
-        # an incremental status:"running" write must not finalize the run
-        # early (same contract as the doctor apply worker).
-        if report is not None and report.get("status") in ("succeeded", "failed"):
-            break
-        time.sleep(3)
-    if report is None or report.get("status") not in ("succeeded", "failed"):
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        report = {
-            "schema": "abyss-resolution/1", "role": "resolver", "status": "failed",
-            "summary": f"agent timed out after {timeout_s // 60} min",
-            "error": None,
-        }
-    _resolution_finalize(kind, obj_id, report_path, report)
-
-
-def _dispatch_resolution(kind: str, obj_id: int) -> dict:
-    """Dispatch a free-Nous Hermes agent to diagnose + fix a signal/incident."""
-    _init_db()
-    conn = _get_activity_conn()
-    try:
-        if kind == "signals":
-            row = conn.execute("SELECT * FROM signals WHERE id = ?", (obj_id,)).fetchone()
-        else:
-            row = conn.execute("SELECT * FROM incidents WHERE id = ?", (obj_id,)).fetchone()
-    finally:
-        conn.close()
-    if row is None:
-        return {"error": f"{kind[:-1]} {obj_id} not found", "code": 404}
-    row = dict(row)
-    if row.get("resolution_status") == "running":
-        # A run left "running" by a crashed/restarted backend (its worker
-        # thread died with the old process) would block re-dispatch forever —
-        # the UI's resolve button would hang. Treat runs started longer than
-        # the agent timeout (+2 min margin) as stale and allow a fresh run.
-        started = row.get("resolution_started_at")
-        stale = True
-        if started:
-            try:
-                stale = (time.time() - datetime.fromisoformat(started).timestamp()) > (_AGENT_DEFAULT_TIMEOUT + 120)
-            except (ValueError, TypeError):
-                stale = True  # unparseable start = orphaned row
-        if not stale:
-            return {"status": "already_running", "kind": kind, "id": obj_id}
-
-    report_id = f"{kind[:-1]}-{obj_id}-{int(time.time())}"
-    report_path = _RESOLUTION_DIR / f"{report_id}.json"
-    prompt = _build_resolver_prompt(kind, row, _resolution_context(kind, row), report_path)
-
-    now = datetime.now().isoformat()
-    _init_db()
-    conn = _get_activity_conn()
-    try:
-        if kind == "signals":
-            conn.execute(
-                """UPDATE signals SET resolution_status = 'running', resolution_started_at = ?,
-                       resolution_finished_at = NULL, resolution_note = NULL WHERE id = ?""",
-                (now, obj_id),
-            )
-        else:
-            conn.execute(
-                """UPDATE incidents SET resolution_status = 'running', resolution_started_at = ?,
-                       resolution_finished_at = NULL, resolution_note = NULL WHERE id = ?""",
-                (now, obj_id),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    _add_activity(
-        action="resolution_dispatched",
-        description=f"Agent dispatched to resolve {kind[:-1]} {obj_id}",
-        category="system",
-        metadata={"kind": kind, "obj_id": obj_id, "report_id": report_id},
-    )
-    threading.Thread(target=_resolution_worker, args=(kind, obj_id, report_path, prompt), daemon=True).start()
-    return {"status": "dispatched", "kind": kind, "id": obj_id, "report_id": report_id}
 
 
 # ---------------------------------------------------------------------------
-# Doctor — full overarching diagnosis with user-approval-gated fixes
+# Doctor: _doctor_context/_doctor_worker/_dispatch_doctor/_doctor_report,
+# _run_benchmark/_doctor_last/_doctor_apply_worker/_dispatch_doctor_apply
+# — extracted to abyss_doctor.py
 # ---------------------------------------------------------------------------
 
-def _doctor_context() -> dict:
-    """Everything the doctor agent needs to form an overarching diagnosis."""
-    health = get_health()
-    failures = get_failures(limit=10)
-    _init_db()
-    conn = _get_activity_conn()
-    try:
-        signals = [dict(r) for r in conn.execute(
-            "SELECT * FROM signals WHERE resolved = 0 ORDER BY timestamp DESC LIMIT 30").fetchall()]
-        incidents = [dict(r) for r in conn.execute(
-            "SELECT * FROM incidents WHERE status IN ('open','acknowledged') ORDER BY timestamp DESC LIMIT 20").fetchall()]
-        errors = [dict(r) for r in conn.execute(
-            """SELECT id, timestamp, action, tool_name, status, metadata
-               FROM activity WHERE status = 'error' ORDER BY timestamp DESC LIMIT 40""").fetchall()]
-    finally:
-        conn.close()
-    return {
-        "health": _redact(health),
-        "failures": _redact(failures),
-        "open_signals": [_redact(s) for s in signals],
-        "open_incidents": [_redact(i) for i in incidents],
-        "recent_errors": [_redact(e) for e in errors],
-    }
 
-
-def _doctor_worker(report_path: Path, prompt: str) -> None:
-    """Background thread for the diagnosis phase (no DB changes)."""
-    timeout_s = _AGENT_DEFAULT_TIMEOUT
-    try:
-        proc = _spawn_agent(prompt, report_path, role="doctor")
-    except Exception as exc:
-        logger.error("Abyss doctor spawn failed: %s", exc)
-        _write_report_file(report_path, {
-            "schema": "abyss-resolution/1", "role": "doctor", "status": "failed",
-            "summary": f"agent spawn failed: {exc}", "error": str(exc),
-        })
-        return
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            break
-        if _read_report_file(report_path) is not None:
-            break
-        time.sleep(3)
-    report = _read_report_file(report_path)
-    if report is None:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        # Structural safety net: even a non-writing agent leaves a trace in
-        # its captured stdout — surface what it FOUND so the run is never a
-        # bare "timed out". The UI shows `error`/`summary` on failed reports.
-        log_tail = ""
-        try:
-            log_path = report_path.with_suffix(".log")
-            if log_path.exists():
-                log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-2500:]
-        except Exception:
-            log_tail = ""
-        _write_report_file(report_path, {
-            "schema": "abyss-resolution/1", "role": "doctor", "status": "failed",
-            "summary": "doctor agent timed out before writing a report",
-            "error": (log_tail.strip() or None),
-        })
-    _add_activity(
-        action="doctor_completed",
-        description="Doctor diagnosis ready",
-        category="system",
-        metadata={"report_id": report_path.stem},
-    )
-    try:
-        from abyss_wave import emit_abyss_event
-
-        emit_abyss_event("doctor_completed", {
-            "report_id": report_path.stem,
-            "status": (report or {}).get("status", "unknown"),
-        })
-    except Exception as exc:
-        logger.debug("Abyss doctor_completed emit failed: %s", exc)
-
-
-def _dispatch_doctor() -> dict:
-    """Dispatch the doctor agent: full diagnosis + proposed fixes (no changes)."""
-    report_id = f"doctor-{int(time.time())}"
-    report_path = _RESOLUTION_DIR / f"{report_id}.json"
-    context = _doctor_context()
-    prompt = (
-        "You are the Abyss doctor: an autonomous Hermes agent performing a full, overarching "
-        "diagnosis of this Hermes installation's health.\n\n"
-        "Load the 'abyss-doctor' skill and follow it exactly.\n\n"
-        "FULL CONTEXT (JSON):\n" + json.dumps(context, indent=2)[:24000] + "\n\n"
-        "TASK:\n"
-        "1. Synthesize an overarching diagnosis: what is actually wrong, what is noise, and the "
-        "root causes behind the open signals/incidents.\n"
-        "2. Produce a prioritized list of proposed fixes. Each fix MUST carry target_signals / "
-        "target_incidents ids so the backend can resolve them after the user approves.\n"
-        "3. Write your report to ABYSS_REPORT_PATH as JSON with this exact schema:\n"
-        '{"schema":"abyss-resolution/1","role":"doctor","report_id":"' + report_id + '",'
-        '"status":"succeeded","summary":"...",'
-        '"findings":[{"title":"...","detail":"...","evidence":"..."}],'
-        '"proposed_fixes":[{"id":"fix-1","title":"...","action":"...","target_signals":[],"target_incidents":[]}]}\n'
-        "4. WRITE THE REPORT INCREMENTALLY - do NOT leave it to the end. After your FIRST ~8 "
-        "tool actions, write an initial report to ABYSS_REPORT_PATH (status \"running\" is "
-        "acceptable) listing findings so far, then UPDATE the same file as you go. A partial "
-        "report beats a perfect one that never gets written - if you run low on iterations "
-        "the backend still sees your findings.\n"
-        "5. TIME-BOX your investigation: at most ~15 tool actions total. Prefer breadth "
-        "(taxonomy queries + code grep for the top error signatures, per the abyss-doctor "
-        "skill's deep-diagnosis method) over deep dives into any single file. If you cannot "
-        "finish, write a PARTIAL report with status \"succeeded\" and your findings so far.\n"
-        "6. Your final chat response must be the one-line summary.\n"
-        "Do NOT change anything yet — the user approves fixes before they are applied."
-    )
-    _add_activity(
-        action="doctor_dispatched",
-        description="Doctor agent dispatched for full diagnosis",
-        category="system",
-        metadata={"report_id": report_id},
-    )
-    threading.Thread(target=_doctor_worker, args=(report_path, prompt), daemon=True).start()
-    return {"status": "dispatched", "report_id": report_id}
-
-
-def _doctor_report(report_id: str) -> dict:
-    """Poll endpoint: returns the doctor report once the agent has written it."""
-    if not report_id or not re.fullmatch(r"[A-Za-z0-9._-]+", report_id):
-        return {"status": "invalid", "error": "bad report_id"}
-    report_path = _RESOLUTION_DIR / f"{report_id}.json"
-    report = _read_report_file(report_path)
-    if report is None:
-        return {"status": "running", "report_id": report_id}
-    return {"status": "ready", "report_id": report_id, "report": report}
-
-
-def _run_benchmark() -> dict:
-    """Run the Abyss Bench Layer 1 probe suite (deterministic, zero tokens).
-
-    Invokes ``evals/abyssbench/runner.py probes --json`` from the hermes-agent
-    tree and returns the per-probe results. Used by the health-tab benchmark
-    button so a doctor's fixes are scored against the regression suite.
-    """
-    agent_root = Path(HERMES_HOME) / "hermes-agent"
-    evals_dir = agent_root / "evals" / "abyssbench"
-    if not evals_dir.exists():
-        return {"status": "error", "error": f"abyssbench not found at {evals_dir}"}
-    import subprocess
-    env = os.environ.copy()
-    env["HERMES_HOME"] = str(HERMES_HOME)
-    env["HERMES_PROFILE_HOME"] = str(PROFILE_HOME)
-    env["HERMES_AGENT_ROOT"] = str(agent_root)
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(evals_dir / "runner.py"), "probes", "--json"],
-            cwd=str(agent_root), env=env, capture_output=True, text=True,
-            timeout=180, encoding="utf-8", errors="replace",
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except Exception as exc:
-        return {"status": "error", "error": f"benchmark run failed: {exc}"}
-    try:
-        data = json.loads(proc.stdout or "{}")
-    except Exception:
-        data = {}
-    data["status"] = "ok" if data.get("failed", 0) == 0 else "failures"
-    data["stderr_tail"] = (proc.stderr or "")[-300:]
-    return data
-
-
-def _doctor_last() -> dict:
-    """Return the most recent actionable report (resume support).
-
-    Prefers the latest report that still has un-applied proposed fixes —
-    either a completed doctor diagnosis (role=doctor) or a PARTIAL apply run
-    (role=apply, status succeeded/failed, remaining proposed_fixes). Lets the
-    UI load it without re-running the agent.
-    """
-    try:
-        _RESOLUTION_DIR.mkdir(parents=True, exist_ok=True)
-        candidates = []
-        for f in _RESOLUTION_DIR.glob("doctor-*.json"):
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if not isinstance(data, dict):
-                continue
-            role = data.get("role")
-            status = data.get("status")
-            remaining = data.get("proposed_fixes") or []
-            if role == "doctor" and status == "succeeded" and remaining:
-                candidates.append((f.stat().st_mtime, f.stem, data))
-            elif role == "apply" and status in ("succeeded", "failed") and remaining:
-                candidates.append((f.stat().st_mtime, f.stem, data))
-        if not candidates:
-            return {"status": "none"}
-        _, report_id, data = max(candidates, key=lambda x: x[0])
-        return {"status": "ready", "report_id": report_id, "report": data}
-    except Exception as exc:
-        return {"status": "error", "error": str(exc)}
-
-
-def _doctor_apply_worker(report_path: Path, prompt: str) -> None:
-    """Background thread for the apply phase: wait for the apply agent, then
-    resolve every signal/incident the report says was actually fixed."""
-    timeout_s = _AGENT_DEFAULT_TIMEOUT
-    try:
-        proc = _spawn_agent(prompt, report_path, role="apply")
-    except Exception as exc:
-        logger.error("Abyss doctor apply spawn failed: %s", exc)
-        _write_report_file(report_path, {
-            "schema": "abyss-resolution/1", "role": "apply", "status": "failed",
-            "summary": f"apply agent spawn failed: {exc}", "error": str(exc),
-        })
-        return
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            break  # agent exited — finalize from whatever it wrote
-        report = _read_report_file(report_path)
-        # IMPORTANT: only a TERMINAL report (the agent marking itself done)
-        # ends the wait. The agent writes INCREMENTALLY (fixes[] grows one by
-        # one, status stays "in_progress") — breaking on the first partial
-        # fixes[] finalized the run at 2/8 fixes (see the 08:07 run).
-        if (
-            isinstance(report, dict)
-            and report.get("role") == "apply"
-            and report.get("status") in ("succeeded", "failed")
-        ):
-            break
-        time.sleep(3)
-    report = _read_report_file(report_path)
-    if report is None:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-        _write_report_file(report_path, {
-            "schema": "abyss-resolution/1", "role": "apply", "status": "failed",
-            "summary": "apply agent timed out", "error": None,
-        })
-        return
-    fixes = report.get("fixes")
-    if not isinstance(fixes, list) or not fixes:
-        # The agent exited WITHOUT writing fix outcomes (iteration cap, error,
-        # or a lost final write). Write a TERMINAL failed state so the UI poll
-        # can leave "applying…" — otherwise the report keeps showing the
-        # doctor's status:succeeded and the dashboard polls forever.
-        _write_report_file(report_path, {
-            **report,
-            "role": "apply",
-            "status": "failed",
-            "summary": "apply agent exited without recording fix outcomes (iteration cap / error); "
-                       "the report was not updated with a fixes[] array",
-            "error": "agent exited without writing fixes[]",
-            "fixes": [],
-        })
-        _add_activity(
-            action="doctor_applied",
-            description="Doctor apply finished: 0 fixes recorded (agent exited without report update)",
-            category="system",
-            status="error",
-            metadata={"report_id": report_path.stem, "applied": 0, "total": 0, "terminal": "failed"},
-        )
-        return
-    applied = 0
-    for fix in fixes:
-        if fix.get("status") == "applied":
-            applied += 1
-            note = (fix.get("note") or fix.get("title") or "")[:2000]
-            for sid in (fix.get("target_signals") or []):
-                _mark_resolution("signals", sid, "succeeded", note)
-            for iid in (fix.get("target_incidents") or []):
-                _mark_resolution("incidents", iid, "succeeded", note)
-    _add_activity(
-        action="doctor_applied",
-        description=f"Doctor apply finished: {applied}/{len(fixes)} fixes applied",
-        category="system",
-        status="completed" if applied == len(fixes) else "error",
-        metadata={"report_id": report_path.stem, "applied": applied, "total": len(fixes)},
-    )
-
-
-def _dispatch_doctor_apply(report_id: str, body: dict) -> dict:
-    """Apply the approved fixes from a doctor report (agent does the work)."""
-    if not report_id or not re.fullmatch(r"[A-Za-z0-9._-]+", report_id):
-        return {"error": "invalid report_id", "code": 400}
-    report_path = _RESOLUTION_DIR / f"{report_id}.json"
-    report = _read_report_file(report_path)
-    if report is None or report.get("status") != "succeeded":
-        return {"error": "doctor report not found or not ready", "code": 404}
-    fixes = report.get("proposed_fixes") or []
-    if not fixes:
-        return {"error": "doctor report has no proposed fixes", "code": 400}
-    approved = body.get("fix_ids") or [f.get("id") for f in fixes]
-    selected = [f for f in fixes if f.get("id") in approved]
-    if not selected:
-        return {"error": "no approved fixes", "code": 400}
-    prompt = (
-        "You are the Abyss doctor apply phase. The user has APPROVED the following fixes.\n\n"
-        "Load the 'abyss-doctor' skill and follow it exactly.\n\n"
-        "APPROVED FIXES (JSON):\n" + json.dumps(_redact({"report_id": report_id, "fixes": selected}), indent=2)[:16000] + "\n\n"
-        "TASK:\n"
-        "1. Apply each approved fix on the backend. Use tools, edit files/configs, restart "
-        "processes as needed. Verify each fix actually worked.\n"
-        "2. For every fix that is reusable, save a skill named abyss-fix-<pattern> documenting it.\n"
-        "3. UPDATE the existing report file at ABYSS_REPORT_PATH (same file) so it now has:\n"
-        '{"fixes":[{"id":"fix-1","status":"applied|skipped|failed","note":"...","skill_saved":"...","target_signals":[],"target_incidents":[]}],'
-        '"summary":"outcome","status":"succeeded|failed"}\n'
-        "Keep the rest of the report intact (findings, proposed_fixes).\n"
-        "4. WRITE THE REPORT INCREMENTALLY - do NOT leave it to the end. As soon as each "
-        "fix is applied and verified, append its outcome to the fixes[] array in "
-        "ABYSS_REPORT_PATH and save. If you run low on iterations, the partial fixes[] "
-        "still unblocks the backend and the dashboard. A final save after all fixes is "
-        "optional, not required.\n"
-        "5. Your final chat response must be the one-line outcome summary.\n"
-        "Do NOT touch the Abyss SQLite databases — the backend resolves signals/incidents from your report."
-    )
-    _add_activity(
-        action="doctor_approve_dispatched",
-        description=f"Apply agent dispatched for {len(selected)} approved fix(es)",
-        category="system",
-        metadata={"report_id": report_id, "fix_ids": approved},
-    )
-    # Reset the report to a NON-terminal apply state BEFORE the worker starts.
-    # Re-approving a report that already has status succeeded/failed would make
-    # the worker's terminal check fire instantly and finalize at 0 new fixes.
-    report = _read_report_file(report_path) or {}
-    _write_report_file(report_path, {
-        **report,
-        "role": "apply",
-        "status": "in_progress",
-        "summary": (report.get("summary") or "Apply phase started."),
-    })
-    threading.Thread(target=_doctor_apply_worker, args=(report_path, prompt), daemon=True).start()
-    return {"status": "dispatched", "report_id": report_id, "fix_count": len(selected)}
-
-
-def _cluster_incidents(alert: bool = True) -> list:
-    """Group related signals into incidents (Raindrop pattern).
-
-    Clustering rules:
-    - 2+ signals in the same session (any type) -> incident
-    - 3+ signals of the same type across sessions within a 60-minute window -> incident
-    - Same pattern + session already has an open incident -> merge into it
-      (bump signal_count, extend signal_ids)
-    Returns a list of incident IDs created or updated.
-
-    ``alert`` controls webhook alerting for newly-created incidents; pass
-    False for startup maintenance so first-boot clustering doesn't spam.
-    """
-    _init_db()
-    conn = _get_activity_conn()
-    touched = []
-    try:
-        signal_rows = conn.execute("""
-            SELECT id, session_id, signal_type, severity, timestamp
-            FROM signals WHERE resolved = 0 AND acknowledged = 0 AND incident_id IS NULL
-            ORDER BY timestamp DESC
-        """).fetchall()
-
-        if not signal_rows:
-            return touched
-
-        # Group 1: same session, 2+ signals
-        session_groups: Dict[str, list] = {}
-        for row in signal_rows:
-            sid = row["session_id"] or "unknown"
-            session_groups.setdefault(sid, []).append(dict(row))
-
-        for sid, signals in session_groups.items():
-            if len(signals) < 2:
-                continue
-            # Look for an existing open incident for this session+pattern
-            existing = conn.execute(
-                "SELECT id FROM incidents WHERE status = 'open' AND session_ids = ? AND pattern = ?",
-                (sid, "multi_signal"),
-            ).fetchone()
-            signal_ids = [s["id"] for s in signals]
-            max_sev = max((_SEVERITY_RANK.get(s["severity"], 1) for s in signals), default=1)
-            max_sev_label = next((k for k, v in sorted(_SEVERITY_RANK.items(), key=lambda kv: kv[1], reverse=True) if v <= max_sev), "warning")
-            types = sorted({s["signal_type"] for s in signals})
-            if existing:
-                conn.execute(
-                    """UPDATE incidents SET signal_count = signal_count + ?, signal_ids = ?
-                       WHERE id = ?""",
-                    (len(signals), json.dumps(signal_ids), existing["id"]),
-                )
-                incident_id = existing["id"]
-            else:
-                cursor = conn.execute(
-                    """INSERT INTO incidents
-                       (timestamp, title, description, severity, signal_count, session_ids, pattern, status, created_at, signal_ids)
-                       VALUES (?, ?, ?, ?, ?, ?, 'multi_signal', 'open', ?, ?)""",
-                    (
-                        datetime.now().isoformat(),
-                        f"Signal cluster: {len(signals)} signals in session {str(sid)[:8]}",
-                        f"Multiple signals detected: {', '.join(types)}",
-                        max_sev_label,
-                        len(signals),
-                        sid,
-                        datetime.now().isoformat(),
-                        json.dumps(signal_ids),
-                    )
-                )
-                incident_id = cursor.lastrowid
-                if alert:
-                    new_row = conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
-                    if new_row:
-                        _alert_on_incident(dict(new_row))
-            conn.execute("UPDATE signals SET incident_id = ? WHERE id IN (%s)" % ",".join("?" * len(signal_ids)),
-                         [incident_id] + signal_ids)
-            conn.commit()
-            touched.append(incident_id)
-
-        # Group 2: same signal_type across sessions within a 60-min window (3+)
-        type_windows: Dict[str, list] = {}
-        for row in signal_rows:
-            type_windows.setdefault(row["signal_type"], []).append(dict(row))
-
-        for stype, signals in type_windows.items():
-            if len(signals) < 3 or stype in ("self_diagnostic",):
-                continue
-            # Group by contiguous time windows (sorted ascending)
-            ordered = sorted(signals, key=lambda s: s["timestamp"])
-            windows = []
-            current = []
-            for s in ordered:
-                if not current:
-                    current = [s]
-                    continue
-                try:
-                    prev_ts = datetime.fromisoformat(current[-1]["timestamp"])
-                    cur_ts = datetime.fromisoformat(s["timestamp"])
-                    gap = (cur_ts - prev_ts).total_seconds()
-                except (ValueError, TypeError):
-                    gap = 0
-                if gap <= 3600:
-                    current.append(s)
-                else:
-                    windows.append(current)
-                    current = [s]
-            if current:
-                windows.append(current)
-
-            for win in windows:
-                if len(win) < 3:
-                    continue
-                signal_ids = [s["id"] for s in win]
-                max_sev = max((_SEVERITY_RANK.get(s["severity"], 1) for s in win), default=1)
-                max_sev_label = next((k for k, v in sorted(_SEVERITY_RANK.items(), key=lambda kv: kv[1], reverse=True) if v <= max_sev), "warning")
-                sessions = sorted({s["session_id"] or "unknown" for s in win})
-                existing = conn.execute(
-                    "SELECT id FROM incidents WHERE status = 'open' AND pattern = ? AND session_ids = ?",
-                    (f"{stype}_burst", ",".join(sessions)),
-                ).fetchone()
-                if existing:
-                    conn.execute(
-                        "UPDATE incidents SET signal_count = signal_count + ?, signal_ids = ? WHERE id = ?",
-                        (len(signal_ids), json.dumps(signal_ids), existing["id"]),
-                    )
-                    incident_id = existing["id"]
-                else:
-                    cursor = conn.execute(
-                        """INSERT INTO incidents
-                           (timestamp, title, description, severity, signal_count, session_ids, pattern, status, created_at, signal_ids)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
-                        (
-                            datetime.now().isoformat(),
-                            f"Signal burst: {len(signal_ids)}x '{stype}' across {len(sessions)} session(s)",
-                            f"Repeated {stype} signals within a 60-minute window",
-                            max_sev_label,
-                            len(signal_ids),
-                            ",".join(sessions),
-                            f"{stype}_burst",
-                            datetime.now().isoformat(),
-                            json.dumps(signal_ids),
-                        )
-                    )
-                    incident_id = cursor.lastrowid
-                    if alert:
-                        new_row = conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
-                        if new_row:
-                            _alert_on_incident(dict(new_row))
-                conn.execute("UPDATE signals SET incident_id = ? WHERE id IN (%s)" % ",".join("?" * len(signal_ids)),
-                             [incident_id] + signal_ids)
-                conn.commit()
-                touched.append(incident_id)
-    finally:
-        conn.close()
-    return list(dict.fromkeys(touched))
+# (_cluster_incidents extracted to abyss_incidents.py)
 
 
 def _prune_data(days: int = 30) -> dict:
-    """Delete activity/traces/signals/incidents older than ``days``.
+    """Delete activity/traces/signals/incidents + wave tables older than ``days``.
 
     Returns counts of deleted rows per table. ``days <= 0`` is a no-op.
+    Since the Aug-2026 wave landed, the wave tables (plugin_events, streams,
+    api_requests, subagents, approvals, commands, platform_events, skills)
+    also carry timestamps and were NOT covered here — retention_days was
+    silently no-op for them and they grew unbounded. They are pruned via
+    abyss_wave.prune_wave_data (fail-open) and their counts merged.
     """
     if days <= 0:
-        return {"activity": 0, "traces": 0, "signals": 0, "incidents": 0}
+        base = {"activity": 0, "traces": 0, "signals": 0, "incidents": 0}
+        try:
+            from abyss_wave import _WAVE_TABLES
+
+            base.update({t: 0 for t in _WAVE_TABLES})
+        except Exception:
+            pass
+        return base
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
     counts = {}
     _init_db()
@@ -1913,275 +826,21 @@ def _prune_data(days: int = 30) -> dict:
             tconn.commit()
     finally:
         tconn.close()
+    # Wave tables (same activity DB): prune fail-open and merge per-table
+    # counts so /abyss prune and POST /prune report the full footprint.
+    try:
+        from abyss_wave import prune_wave_data
+
+        counts.update(prune_wave_data(days))
+    except Exception as exc:
+        logger.debug("Abyss wave prune skipped: %s", exc)
     return counts
 
 
 # ---------------------------------------------------------------------------
 # Analytics: health score, trends, failure taxonomy, export, status
+# (extracted to abyss_analytics.py)
 # ---------------------------------------------------------------------------
-
-def get_health() -> dict:
-    """Compute an overall agent health score (0-100) and a breakdown.
-
-    Modeled on Raindrop-style health panels:
-      - error rate      (tool/LLM failures vs total activity) — 40 pts
-      - open signals    (unacknowledged anomalies)             — 25 pts
-      - open incidents  (unresolved clusters)                  — 25 pts
-      - recent activity (24h liveliness / starvation guard)    — 10 pts
-    """
-    _init_db()
-    conn = _get_activity_conn()
-    try:
-        total = conn.execute("SELECT COUNT(*) FROM activity").fetchone()[0]
-        errors = conn.execute("SELECT COUNT(*) FROM activity WHERE status = 'error'").fetchone()[0]
-        # Recency window: a backlog of old signals/incidents (e.g. a noisy cron
-        # job) must not pin the score at "critical" forever. Only signals from
-        # the last 7 days count against health.
-        week_ago = (datetime.now() - timedelta(days=7)).isoformat()
-        signal_open = conn.execute(
-            "SELECT COUNT(*) FROM signals WHERE resolved = 0 AND timestamp >= ?",
-            (week_ago,),
-        ).fetchone()[0]
-        incident_open = conn.execute(
-            "SELECT COUNT(*) FROM incidents WHERE status IN ('open', 'acknowledged') AND created_at >= ?",
-            (week_ago,),
-        ).fetchone()[0]
-        day_ago = (datetime.now() - timedelta(days=1)).isoformat()
-        activity_24h = conn.execute(
-            "SELECT COUNT(*) FROM activity WHERE timestamp >= ?", (day_ago,)
-        ).fetchone()[0]
-
-        # Error rate: 0% -> 40, 50%+ -> 0
-        err_ratio = (errors / total) if total else 0.0
-        error_score = max(0.0, 40.0 * (1.0 - min(1.0, err_ratio / 0.5)))
-
-        # Signals: 0 open (7d) -> 25, 100+ open (7d) -> 0. Softer than the old
-        # threshold of 20 — with per-tool-error recording, 20 open signals is
-        # normal agent activity, not a health catastrophe.
-        signal_score = max(0.0, 25.0 * (1.0 - min(1.0, signal_open / 100.0)))
-
-        # Incidents: 0 open (7d) -> 25, 20+ open (7d) -> 0
-        incident_score = max(0.0, 25.0 * (1.0 - min(1.0, incident_open / 20.0)))
-
-        # Liveliness: >= 10 activities in 24h -> 10, none -> 0
-        activity_score = max(0.0, 10.0 * min(1.0, activity_24h / 10.0))
-
-        score = round(error_score + signal_score + incident_score + activity_score, 1)
-        if score >= 90:
-            level = "healthy"
-        elif score >= 70:
-            level = "fair"
-        elif score >= 50:
-            level = "degraded"
-        else:
-            level = "critical"
-
-        return {
-            "score": score,
-            "level": level,
-            "components": {
-                "error_rate": round(err_ratio, 4),
-                "error_score": round(error_score, 1),
-                "signal_score": round(signal_score, 1),
-                "incident_score": round(incident_score, 1),
-                "activity_score": round(activity_score, 1),
-            },
-            "counts": {
-                "total_activities": total,
-                "errors": errors,
-                "signals_open": signal_open,
-                "incidents_open": incident_open,
-                "activity_24h": activity_24h,
-            },
-            "generated_at": datetime.now().isoformat(),
-        }
-    finally:
-        conn.close()
-
-
-def get_trends(days: int = 7, bucket: str = "day") -> dict:
-    """Bucket activity, errors, signals and incidents over a time window.
-
-    ``bucket`` is one of "hour" | "day". Returns parallel arrays of
-    timestamps + counts suitable for sparkline/bar rendering.
-    """
-    _init_db()
-    conn = _get_activity_conn()
-    try:
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-        bucket_fmt = "%Y-%m-%d" if bucket == "day" else "%Y-%m-%d %H:00"
-
-        activity_rows = conn.execute(
-            "SELECT timestamp FROM activity WHERE timestamp >= ?", (cutoff,)
-        ).fetchall()
-        error_rows = conn.execute(
-            "SELECT timestamp FROM activity WHERE timestamp >= ? AND status = 'error'", (cutoff,)
-        ).fetchall()
-        signal_rows = conn.execute(
-            "SELECT timestamp FROM signals WHERE timestamp >= ?", (cutoff,)
-        ).fetchall()
-        incident_rows = conn.execute(
-            "SELECT timestamp FROM incidents WHERE timestamp >= ?", (cutoff,)
-        ).fetchall()
-
-        def _bucket(rows):
-            counts = {}
-            for r in rows:
-                try:
-                    key = datetime.fromisoformat(r["timestamp"]).strftime(bucket_fmt)
-                except (ValueError, TypeError):
-                    key = (r["timestamp"] or "")[:16]
-                counts[key] = counts.get(key, 0) + 1
-            return counts
-
-        # Build a contiguous series of buckets between cutoff and now
-        buckets = []
-        step = timedelta(hours=1) if bucket == "hour" else timedelta(days=1)
-        cur = datetime.fromisoformat(cutoff[:19])
-        now = datetime.now()
-        while cur <= now:
-            buckets.append(cur.strftime(bucket_fmt))
-            cur += step
-
-        a = _bucket(activity_rows)
-        e = _bucket(error_rows)
-        s = _bucket(signal_rows)
-        i = _bucket(incident_rows)
-
-        return {
-            "bucket": bucket,
-            "days": days,
-            "timestamps": buckets,
-            "activity": [a.get(b, 0) for b in buckets],
-            "errors": [e.get(b, 0) for b in buckets],
-            "signals": [s.get(b, 0) for b in buckets],
-            "incidents": [i.get(b, 0) for b in buckets],
-        }
-    finally:
-        conn.close()
-
-
-def get_failures(limit: int = 15) -> dict:
-    """Root-cause taxonomy: most frequent signal types, failing tools,
-    and common error messages (normalized)."""
-    _init_db()
-    conn = _get_activity_conn()
-    try:
-        signal_rows = conn.execute(
-            """SELECT s.signal_type, s.label, s.description, s.severity,
-                      a.tool_name AS tool_name
-               FROM signals s
-               LEFT JOIN activity a ON a.id = s.activity_id
-               ORDER BY s.timestamp DESC LIMIT 500"""
-        ).fetchall()
-        err_rows = conn.execute(
-            "SELECT metadata, tool_name FROM activity WHERE status = 'error' ORDER BY timestamp DESC LIMIT 500"
-        ).fetchall()
-
-        type_counts: Dict[str, int] = {}
-        tool_counts: Dict[str, int] = {}
-        msg_counts: Dict[str, int] = {}
-
-        for s in signal_rows:
-            type_counts[s["signal_type"]] = type_counts.get(s["signal_type"], 0) + 1
-
-        for r in err_rows:
-            tool = (r["tool_name"] or "unknown").strip()
-            if tool:
-                tool_counts[tool] = tool_counts.get(tool, 0) + 1
-            meta = {}
-            try:
-                meta = json.loads(r["metadata"] or "{}")
-            except (ValueError, TypeError):
-                pass
-            msg = (meta.get("error_message") or "").strip()
-            if msg:
-                # Normalize: lowercase, trim to a fingerprint
-                norm = " ".join(msg.lower().split())[:120]
-                msg_counts[norm] = msg_counts.get(norm, 0) + 1
-
-        return {
-            "by_type": [{"type": k, "count": v} for k, v in
-                        sorted(type_counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]],
-            "by_tool": [{"tool": k, "count": v} for k, v in
-                        sorted(tool_counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]],
-            "by_message": [{"message": k, "count": v} for k, v in
-                           sorted(msg_counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]],
-        }
-    finally:
-        conn.close()
-
-
-def export_data() -> dict:
-    """Full JSON snapshot of all Abyss tables — for backup/migration."""
-    _init_db()
-    conn = _get_activity_conn()
-    try:
-        def dump(table):
-            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
-            return [dict(r) for r in rows]
-        data = {
-            "exported_at": datetime.now().isoformat(),
-            "activity": dump("activity"),
-            "signals": dump("signals"),
-            "incidents": dump("incidents"),
-        }
-    finally:
-        conn.close()
-    tconn = _get_trace_conn()
-    try:
-        data["traces"] = [dict(r) for r in tconn.execute("SELECT * FROM traces").fetchall()]
-    finally:
-        tconn.close()
-    return data
-
-
-def get_status() -> dict:
-    """Lightweight status summary for the desktop statusbar chip / polling."""
-    _init_db()
-    conn = _get_activity_conn()
-    try:
-        signal_open = conn.execute("SELECT COUNT(*) FROM signals WHERE resolved = 0").fetchone()[0]
-        signal_total = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-        incident_open = conn.execute("SELECT COUNT(*) FROM incidents WHERE status IN ('open', 'acknowledged')").fetchone()[0]
-        day_ago = (datetime.now() - timedelta(days=1)).isoformat()
-        activity_24h = conn.execute(
-            "SELECT COUNT(*) FROM activity WHERE timestamp >= ?", (day_ago,)
-        ).fetchone()[0]
-        # Real severity breakdown of OPEN signals (the UI must not sample a
-        # limited signal list and present it as totals — it used to fetch
-        # /signals?limit=50 and show "50 SIG / 43 critical" when 800+ existed).
-        severity_counts = {"critical": 0, "error": 0, "warning": 0, "info": 0}
-        for sev, count in conn.execute(
-            "SELECT severity, COUNT(*) FROM signals WHERE resolved = 0 GROUP BY severity"
-        ).fetchall():
-            sev = (sev or "info").lower()
-            if sev in severity_counts:
-                severity_counts[sev] = count
-            else:
-                severity_counts["info"] += count
-        resolutions_running = conn.execute(
-            "SELECT COUNT(*) FROM signals WHERE resolution_status = 'running'"
-        ).fetchone()[0] + conn.execute(
-            "SELECT COUNT(*) FROM incidents WHERE resolution_status = 'running'"
-        ).fetchone()[0]
-    finally:
-        conn.close()
-    health = get_health()
-    return {
-        "score": health["score"],
-        "level": health["level"],
-        "signals_open": signal_open,
-        "signals_total": signal_total,
-        "signals_critical": severity_counts["critical"],
-        "signals_error": severity_counts["error"],
-        "signals_warning": severity_counts["warning"],
-        "signals_info": severity_counts["info"],
-        "incidents_open": incident_open,
-        "activity_24h": activity_24h,
-        "resolutions_running": resolutions_running,
-        "generated_at": datetime.now().isoformat(),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -2281,29 +940,40 @@ def _alert_on_incident(incident: dict) -> None:
 
 
 
-def list_activity(limit: int = 50, category: Optional[str] = None, since: Optional[str] = None):
-    """List activity feed entries."""
+def list_activity(limit: int = 50, category: Optional[str] = None, since: Optional[str] = None,
+                  session_id: Optional[str] = None):
+    """List activity feed entries.
+
+    Filters are ANDed: ``category``, ``since`` (ISO timestamp), ``session_id``.
+    ``session_id`` rounds out the filter family the other list surfaces
+    already expose (``/trace``, ``/signals``, ``/incidents``) so the UI can
+    drill one session's full activity story without a separate endpoint.
+    """
     _init_db()
     conn = _get_activity_conn()
-    query = "SELECT * FROM activity"
-    params = []
+    try:
+        query = "SELECT * FROM activity"
+        params = []
 
-    if since:
-        query += " WHERE timestamp >= ?"
-        params.append(since)
+        where = []
+        if since:
+            where.append("timestamp >= ?")
+            params.append(since)
+        if category:
+            where.append("category = ?")
+            params.append(category)
+        if session_id:
+            where.append("session_id = ?")
+            params.append(session_id)
+        if where:
+            query += " WHERE " + " AND ".join(where)
 
-    if category:
-        if "WHERE" in query:
-            query += " AND category = ?"
-        else:
-            query += " WHERE category = ?"
-        params.append(category)
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
 
-    query += " ORDER BY timestamp DESC LIMIT ?"
-    params.append(limit)
-
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
+        rows = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
     return [dict(row) for row in rows]
 
 
@@ -2311,14 +981,325 @@ def get_session_trace(session_id: str, limit: int = 200):
     """Get the full trace/timeline for a session."""
     _init_db()
     conn = _get_trace_conn()
-    rows = conn.execute(
-        """SELECT * FROM traces
-           WHERE session_id = ?
-           ORDER BY timestamp ASC LIMIT ?""",
-        (session_id, limit)
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM traces
+              WHERE session_id = ?
+              ORDER BY timestamp ASC LIMIT ?""",
+            (session_id, limit)
+        ).fetchall()
+    finally:
+        conn.close()
     return [dict(row) for row in rows]
+
+
+# ===========================================================================
+# Trace graph-node system (Raindrop-style "trajectory" visualization)
+# ===========================================================================
+
+def _parse_evt(raw):
+    """Safely parse a trace event_data JSON blob into a dict."""
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _iso_ms(ts: Optional[str]):
+    """Return epoch milliseconds for an ISO timestamp (None if unparsable)."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts).timestamp() * 1000.0
+    except (ValueError, TypeError):
+        return None
+
+
+def get_trace_graph(session_id: str, limit: int = 300):
+    """Build a visual DAG (graph-node system) of a session's trajectory.
+
+    Pairs ``tool_call`` start/end events (by ``tool_call_id``) into a single
+    node carrying status/duration/error, groups each reasoning (``llm_call``)
+    turn with the tool calls it spawned, and returns nodes + edges the UI can
+    lay out as a graph instead of a flat list. Mirrors Raindrop's "visualize
+    agent trajectories: every tool call, error, and recovery" model.
+    """
+    _init_db()
+    conn = _get_trace_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM traces WHERE session_id = ? ORDER BY id ASC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    tool_nodes: Dict[str, dict] = {}   # tool_call_id -> node
+    tool_seq: list = []                # chronological tool key order
+    llm_nodes: list = []               # llm node dicts in order
+    llm_keys: list = []                # keys in order
+    current_llm: Optional[str] = None  # active reasoning turn
+
+    for row in rows:
+        et = row["event_type"]
+        d = _parse_evt(row["event_data"])
+        tcid = str(d.get("tool_call_id") or f"tc_{row['id']}")
+        if et == "tool_call":
+            if tcid not in tool_nodes:
+                tool_nodes[tcid] = {
+                    "id": f"node_{tcid}",
+                    "type": "tool",
+                    "label": str(d.get("tool") or "tool_call")[:48],
+                    "tool": d.get("tool"),
+                    "status": "running",
+                    "error_type": None,
+                    "error_message": None,
+                    "duration_ms": row["duration_ms"],
+                    "start": row["timestamp"],
+                    "end": None,
+                    "parent": current_llm,
+                    "result_preview": None,
+                }
+                tool_seq.append(tcid)
+            n = tool_nodes[tcid]
+            if d.get("phase") == "end":
+                n["end"] = row["timestamp"]
+                is_err = (d.get("status") == "error") or bool(d.get("error_type"))
+                n["status"] = "error" if is_err else "ok"
+                if d.get("error_type"):
+                    n["error_type"] = str(d["error_type"])[:80]
+                if d.get("error_message"):
+                    n["error_message"] = str(d["error_message"])[:400]
+                n["result_preview"] = d.get("result_preview")
+                if row["duration_ms"]:
+                    n["duration_ms"] = row["duration_ms"]
+                else:
+                    s = _iso_ms(n["start"]); e = _iso_ms(row["timestamp"])
+                    if s is not None and e is not None:
+                        n["duration_ms"] = int(e - s)
+        elif et == "llm_call":
+            key = f"llm_{row['id']}"
+            llm_nodes.append({
+                "id": f"node_{key}",
+                "type": "llm",
+                "label": str(d.get("model") or "reasoning")[:48],
+                "model": d.get("model"),
+                "status": "ok",
+                "duration_ms": row["duration_ms"],
+                "start": row["timestamp"],
+                "end": row["timestamp"],
+                "parent": None,
+                "result_preview": d.get("result_preview"),
+            })
+            llm_keys.append(key)
+            current_llm = key
+        # session_start / session_end / memory events -> implicit context
+
+    # Assemble node list in chronological order (llms interleaved with tools)
+    nodes = [{"id": "node_root", "type": "session", "label": "session",
+              "status": "ok", "duration_ms": None, "start": None, "end": None,
+              "parent": None}]
+    edges = []
+
+    def _llm_id(k):
+        return f"node_{k}"
+
+    # Map tool -> parent llm (or root)
+    for tcid in tool_seq:
+        n = tool_nodes[tcid]
+        parent = n.get("parent")
+        edges.append({
+            "source": _llm_id(parent) if parent and parent in llm_keys else "node_root",
+            "target": n["id"],
+            "type": "spawn",
+        })
+    for key in llm_keys:
+        edges.append({"source": "node_root", "target": _llm_id(key), "type": "spawn"})
+
+    # Interleave llm + tool nodes in acquisition order (left->right flow):
+    # a reasoning node appears when it first owns a following tool node.
+    llm_by_key = {n["id"][len("node_"):]: n for n in llm_nodes}
+    ordered: list = [nodes[0]]
+    seen: set = {nodes[0]["id"]}
+    for tcid in tool_seq:
+        n = tool_nodes[tcid]
+        parent_key = n.get("parent")
+        if parent_key and parent_key in llm_by_key and llm_by_key[parent_key]["id"] not in seen:
+            ordered.append(llm_by_key[parent_key])
+            seen.add(llm_by_key[parent_key]["id"])
+        if n["id"] not in seen:
+            ordered.append(n)
+            seen.add(n["id"])
+    for key in llm_keys:
+        nid = f"node_{key}"
+        if nid not in seen:
+            ordered.append(llm_by_key[key])
+            seen.add(nid)
+    nodes = ordered
+
+    ok = sum(1 for n in nodes if n["type"] == "tool" and n["status"] == "ok")
+    err = sum(1 for n in nodes if n["type"] == "tool" and n["status"] == "error")
+    open_ = sum(1 for n in nodes if n["type"] == "tool" and n["status"] == "running")
+    llm_c = sum(1 for n in nodes if n["type"] == "llm")
+
+    return {
+        "session_id": session_id,
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {
+            "tools": ok + err + open_,
+            "ok": ok, "errors": err, "open": open_, "llms": llm_c,
+        },
+        "generated_at": datetime.now().isoformat(),
+    }
+
+
+def get_trace_timeline(session_id: str, limit: int = 300):
+    """Build per-lane timeline data for one session (single-agent trajectory).
+
+    Positions each event as a horizontal bar relative to session start so the
+    UI can render lanes (reasoning / tools / failures) — each agent's session
+    read as a timeline, Raindrop-style.
+    """
+    _init_db()
+    conn = _get_trace_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM traces WHERE session_id = ? ORDER BY id ASC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    tool_nodes: Dict[str, dict] = {}
+    llm_nodes: list = []
+    base = None
+    for row in rows:
+        d = _parse_evt(row["event_data"])
+        ts_ms = _iso_ms(row["timestamp"])
+        if ts_ms is not None:
+            base = ts_ms if base is None else min(base, ts_ms)
+        tcid = str(d.get("tool_call_id") or f"tc_{row['id']}")
+        if row["event_type"] == "tool_call":
+            if tcid not in tool_nodes:
+                tool_nodes[tcid] = {
+                    "id": f"node_{tcid}", "label": str(d.get("tool") or "tool")[:48],
+                    "tool": d.get("tool"), "status": "running",
+                    "error_type": None, "error_message": None,
+                    "start_ms": ts_ms, "end_ms": None, "duration_ms": row["duration_ms"],
+                }
+            n = tool_nodes[tcid]
+            if d.get("phase") == "end":
+                n["end_ms"] = ts_ms
+                n["status"] = "error" if d.get("status") == "error" or d.get("error_type") else "ok"
+                if d.get("error_type"):
+                    n["error_type"] = str(d["error_type"])[:80]
+                if d.get("error_message"):
+                    n["error_message"] = str(d["error_message"])[:400]
+                if row["duration_ms"]:
+                    n["duration_ms"] = row["duration_ms"]
+                elif n["start_ms"] is not None and ts_ms is not None:
+                    n["duration_ms"] = int(ts_ms - n["start_ms"])
+            else:
+                if n["start_ms"] is None:
+                    n["start_ms"] = ts_ms
+        elif row["event_type"] == "llm_call":
+            llm_nodes.append({
+                "id": f"node_llm_{row['id']}", "label": str(d.get("model") or "reasoning")[:48],
+                "model": d.get("model"), "status": "ok",
+                "start_ms": ts_ms, "end_ms": ts_ms, "duration_ms": row["duration_ms"],
+            })
+
+    if base is None:
+        base = 0
+
+    def _off(ms):
+        return int((ms - base)) if ms is not None else 0
+
+    reasoning = [{
+        "id": n["id"], "label": n["label"], "model": n["model"],
+        "start_ms": _off(n["start_ms"]), "end_ms": _off(n["end_ms"]),
+        "duration_ms": n["duration_ms"], "status": n["status"],
+    } for n in llm_nodes]
+    tools = [{
+        "id": n["id"], "label": n["label"], "tool": n["tool"],
+        "start_ms": _off(n["start_ms"]), "end_ms": _off(n["end_ms"]),
+        "duration_ms": n["duration_ms"], "status": n["status"],
+        "error_type": n["error_type"], "error_message": n["error_message"],
+    } for n in tool_nodes.values()]
+    failures = [t for t in tools if t["status"] == "error"]
+
+    return {
+        "session_id": session_id,
+        "base": base,
+        "total_ms": max((_off(n["end_ms"]) for n in llm_nodes + list(tool_nodes.values()) if n.get("end_ms") is not None), default=1),
+        "lanes": [
+            {"id": "reasoning", "label": "Reasoning", "nodes": reasoning},
+            {"id": "tools", "label": "Tools", "nodes": tools},
+            {"id": "failures", "label": "Failures", "nodes": failures},
+        ],
+        "generated_at": datetime.now().isoformat(),
+    }
+
+
+def get_agents_overview(limit: int = 60):
+    """Per-session (per-agent) overview for an 'every agent as a timeline' view.
+
+    Each session == one agent conversation. Lightweight aggregate row (start,
+    duration, event/error counts, health) rendered as its own timeline lane on
+    a shared time axis.
+    """
+    _init_db()
+    # Per-session aggregate over the trace DB. One connection for the whole
+    # function and ONE aggregate query (the per-session error count used to
+    # open a second query inside the loop — connection churn + N+1 on a
+    # UI-polled endpoint; now folded into the GROUP BY via SUM(CASE ...)).
+    conn = _get_trace_conn()
+    try:
+        # Single aggregate carries the per-session error count too: the old
+        # loop opened a second query PER session (N+1 on a UI-polled
+        # endpoint). Both spacing variants of the error status are matched,
+        # exactly like get_recent_sessions — never the error_type key.
+        aggs = conn.execute(
+            """SELECT session_id,
+                      COUNT(*) AS event_count,
+                      SUM(CASE WHEN event_type='llm_call' THEN 1 ELSE 0 END) AS llm_count,
+                      SUM(CASE WHEN event_type='tool_call'
+                                AND (event_data LIKE '%"status":"error"%'
+                                     OR event_data LIKE '%"status": "error"%')
+                          THEN 1 ELSE 0 END) AS error_count,
+                      MIN(timestamp) AS start_ts,
+                      MAX(timestamp) AS end_ts
+               FROM traces GROUP BY session_id
+               ORDER BY MAX(timestamp) DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+
+        out = []
+        for a in aggs:
+            sid = a["session_id"]
+            errors = int(a["error_count"] or 0)
+            start_ms = _iso_ms(a["start_ts"]) or 0
+            end_ms = _iso_ms(a["end_ts"]) or start_ms
+            out.append({
+                "session_id": sid,
+                "start": start_ms,
+                "end": end_ms,
+                "duration_ms": int(max(end_ms - start_ms, 1)),
+                "event_count": a["event_count"],
+                "llm_count": a["llm_count"] or 0,
+                "error_count": errors,
+                "has_errors": errors > 0,
+            })
+        return {"agents": out, "generated_at": datetime.now().isoformat()}
+    finally:
+        conn.close()
+
+
+
 
 
 def get_graph_data(limit: int = 200):
@@ -2423,11 +1404,12 @@ def get_graph_data(limit: int = 200):
             "weight": e["count"]
         })
 
-    conn.close()
-
-    # Also pull from Hermes state.db for memory nodes
+    # Also pull from Hermes state.db for memory nodes (must stay inside the
+    # activity conn's lifetime — the memory -> session keyword edges query
+    # activity via conn, so closing conn first is a use-after-close).
     state_db = os.path.join(PROFILE_HOME, "state.db")
     if os.path.exists(state_db):
+        sconn = None
         try:
             sconn = sqlite3.connect(state_db)
             sconn.row_factory = sqlite3.Row
@@ -2469,9 +1451,19 @@ def get_graph_data(limit: int = 200):
                                 "weight": 1
                             })
 
-            sconn.close()
         except Exception as e:
             logger.debug("Graph: state.db read failed: %s", e)
+        finally:
+            if sconn is not None:
+                try:
+                    sconn.close()
+                except Exception:
+                    pass
+
+    try:
+        conn.close()
+    except Exception:
+        pass
 
     return {
         "nodes": nodes,
@@ -2546,6 +1538,7 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
                 limit=_int_param(params, "limit", 50),
                 category=params.get("category"),
                 since=params.get("since"),
+                session_id=params.get("session_id"),
             )
 
         elif path == "/activity" and method == "POST":
@@ -2563,8 +1556,17 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
             return result
 
         elif path == "/calendar" and method == "GET":
-            start = params.get("start", datetime.now().isoformat())
-            end = params.get("end", (datetime.now() + timedelta(days=7)).isoformat())
+            # Default start = beginning of today. A naive "now" default was
+            # doubly broken: (1) the REST layer passes an EXPLICIT None for
+            # missing params, so `params.get("start", now)` returned None and
+            # the calendar never included ANY activity rows through the API
+            # (only cron entries); (2) a "now" start would exclude activities
+            # recorded seconds earlier. Start-of-day is what a calendar view
+            # semantically wants: everything since today + the next 7 days.
+            start = params.get("start") or datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+            end = params.get("end") or (datetime.now() + timedelta(days=7)).isoformat()
             return list_calendar(start, end)
 
         elif path == "/search" and method == "GET":
@@ -2587,11 +1589,25 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
             limit = _int_param(params, "limit", 15)
             return get_failures(limit=limit)
 
+        elif path == "/performance" and method == "GET":
+            days = _int_param(params, "days", 7)
+            limit = _int_param(params, "limit", 20)
+            return get_performance(days=days, limit=limit)
+
         elif path == "/export" and method == "GET":
             return export_data()
 
         elif path == "/status" and method == "GET":
             return get_status()
+
+        elif path == "/trace/graph" and method == "GET":
+            return get_trace_graph(params.get("session_id", ""), limit=_int_param(params, "limit", 300))
+
+        elif path == "/trace/timeline" and method == "GET":
+            return get_trace_timeline(params.get("session_id", ""), limit=_int_param(params, "limit", 300))
+
+        elif path == "/trace/agents" and method == "GET":
+            return get_agents_overview(limit=_int_param(params, "limit", 60))
 
         elif path == "/trace" and method == "GET":
             session_id = params.get("session_id", "")
@@ -2608,16 +1624,25 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
         elif path == "/signals" and method == "GET":
             limit = _int_param(params, "limit", 50)
             session_filter = params.get("session_id")
-            query = "SELECT * FROM signals"
+            # The signals table has NO tool_name column (documented gap: the
+            # UI had to guess which tool produced a signal, or join activity
+            # client-side). Enrich each row with the source tool + action from
+            # the linked activity row so the feed shows "terminal -> timeout"
+            # instead of a bare timeout signal. LEFT JOIN keeps
+            # self-diagnostic signals (activity_id NULL) intact.
+            query = ("SELECT s.*, a.tool_name AS tool_name, a.action AS tool_action "
+                     "FROM signals s LEFT JOIN activity a ON a.id = s.activity_id")
             query_params = []
             if session_filter:
-                query += " WHERE session_id = ?"
+                query += " WHERE s.session_id = ?"
                 query_params.append(session_filter)
-            query += " ORDER BY timestamp DESC LIMIT ?"
+            query += " ORDER BY s.timestamp DESC LIMIT ?"
             query_params.append(limit)
             conn = _get_activity_conn()
-            rows = conn.execute(query, query_params).fetchall()
-            conn.close()
+            try:
+                rows = conn.execute(query, query_params).fetchall()
+            finally:
+                conn.close()
             return [dict(row) for row in rows]
 
         elif path == "/incidents" and method == "GET":
@@ -2631,8 +1656,10 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
             query += " ORDER BY timestamp DESC LIMIT ?"
             query_params.append(limit)
             conn = _get_activity_conn()
-            rows = conn.execute(query, query_params).fetchall()
-            conn.close()
+            try:
+                rows = conn.execute(query, query_params).fetchall()
+            finally:
+                conn.close()
             return [dict(row) for row in rows]
 
         elif path == "/signals/self-diagnostic" and method == "POST":
@@ -2644,6 +1671,15 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
                 severity=data.get("severity", "warning"),
             )
             return {"id": sid, "status": "recorded"}
+
+        elif path == "/signals/resolve-bulk" and method == "POST":
+            data = _coerce_body(body)
+            return _resolve_signals_bulk(
+                session_prefix=(data.get("session_prefix") or None),
+                signal_type=(data.get("signal_type") or None),
+                older_than_days=_int_param(data, "older_than_days", 0) or None,
+                close_empty_incidents=bool(data.get("close_empty_incidents", False)),
+            )
 
         elif path == "/incidents/cluster" and method == "POST":
             new_incidents = _cluster_incidents()
@@ -2674,6 +1710,9 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
 
         elif path == "/doctor/report" and method == "GET":
             return _doctor_report(params.get("report_id", ""))
+
+        elif path == "/doctor/log" and method == "GET":
+            return _doctor_log(params.get("report_id", ""))
 
         elif path == "/doctor/last" and method == "GET":
             return _doctor_last()
@@ -2777,27 +1816,83 @@ def list_calendar(start_date: str, end_date: str):
     """List scheduled tasks (cron jobs) for a date range."""
     results = []
 
-    # Read cron jobs from Hermes cron directory
+    # Read cron jobs from Hermes cron directory. The live store is a single
+    # jobs.json containing a `jobs:` array (each job carries its own schedule
+    # object + next_run_at). Older layouts stored one <jobid>.json per job
+    # with top-level schedule/next_run keys — support both so the calendar
+    # never renders a single misparsed "jobs" chip for the aggregate file.
     cron_dir = Path(PROFILE_HOME) / "cron"
+    cron_jobs: list[dict] = []
     if cron_dir.exists():
-        for f in cron_dir.iterdir():
-            if f.is_file() and f.suffix == ".json":
-                try:
-                    data = json.loads(f.read_text())
-                    schedule = data.get("schedule", "")
-                    prompt = data.get("prompt", "")
-                    results.append({
-                        "id": f.stem,
-                        "title": data.get("name", f.stem),
-                        "description": prompt[:100] + "..." if len(prompt) > 100 else prompt,
-                        "schedule": schedule,
-                        "next_run": data.get("next_run", ""),
-                        "enabled": data.get("enabled", True),
-                        "deliver": data.get("deliver", "origin"),
-                        "category": "cron",
-                    })
-                except Exception:
-                    continue
+        jobs_file = cron_dir / "jobs.json"
+        if jobs_file.exists():
+            try:
+                data = json.loads(jobs_file.read_text(encoding="utf-8"))
+                raw = data.get("jobs") if isinstance(data, dict) else data
+                if isinstance(raw, list):
+                    cron_jobs.extend(j for j in raw if isinstance(j, dict) and j.get("id"))
+            except Exception:
+                logger.debug("abyss: failed to read cron jobs store %s", jobs_file)
+        # Legacy layout: individual <jobid>.json files (skip the aggregate store).
+        for f in sorted(cron_dir.glob("*.json")):
+            if f.name == "jobs.json":
+                continue
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    data.setdefault("id", f.stem)
+                    cron_jobs.append(data)
+            except Exception:
+                continue
+
+    # Map job id -> most recent session id recorded in activity
+    # (cron sessions carry session_id = "cron_<jobid>_<YYYYMMDD_HHMMSS>"), so
+    # calendar chips for scheduled jobs get the DESIGN.md `trace ›` drill the
+    # UI already renders when task.session_id is present.
+    latest_session: dict[str, tuple[str, str]] = {}
+    conn = None
+    try:
+        _init_db()
+        conn = _get_activity_conn()
+        try:
+            sid_rows = conn.execute(
+                "SELECT session_id, MAX(timestamp) AS ts FROM activity "
+                "WHERE session_id LIKE 'cron\\_%' ESCAPE '\\' GROUP BY session_id"
+            ).fetchall()
+        except Exception:
+            sid_rows = []
+        for r in sid_rows:
+            sid = r["session_id"] or ""
+            parts = sid.split("_")
+            if len(parts) >= 2 and parts[1]:
+                cur = latest_session.get(parts[1])
+                if cur is None or r["ts"] > cur[1]:
+                    latest_session[parts[1]] = (sid, r["ts"])
+    finally:
+        if conn is not None:
+            conn.close()
+
+    for job in cron_jobs:
+        jid = job.get("id", "")
+        schedule = job.get("schedule")
+        if isinstance(schedule, dict):
+            schedule_display = schedule.get("display") or schedule.get("kind") or ""
+        else:
+            schedule_display = job.get("schedule_display") or str(schedule or "")
+        prompt = job.get("prompt") or ""
+        results.append({
+            "id": jid,
+            "title": job.get("name") or jid,
+            "description": prompt[:100] + "..." if len(prompt) > 100 else prompt,
+            "schedule": schedule_display,
+            "next_run": job.get("next_run_at") or job.get("next_run") or "",
+            "enabled": job.get("enabled", True),
+            "deliver": job.get("deliver", "origin"),
+            "category": "cron",
+            # trace-drill affordance: most recent Abyss-tracked run of this job
+            "session_id": latest_session.get(jid, ("", ""))[0],
+            "last_run": job.get("last_run_at") or "",
+        })
 
     # Also include activities within the date range
     _init_db()
@@ -2816,6 +1911,11 @@ def list_calendar(start_date: str, end_date: str):
             "timestamp": row["timestamp"],
             "category": row["category"],
             "status": row["status"],
+            # DESIGN.md: calendar chips carry a `trace ›` drill when the row
+            # includes a session_id — the affordance lights up here. tool_name
+            # lets the UI show the same per-tool type colors as the activity feed.
+            "session_id": row["session_id"],
+            "tool_name": row["tool_name"],
         })
 
     return results
@@ -2846,9 +1946,10 @@ def global_search(query: str, limit: int = 20):
             "relevance": 1.0,
         })
 
-    # 2. Search Hermes state.db
+    # 2. Search Hermes state.db — guaranteed close of each DB handle even on exception.
     state_db = os.path.join(PROFILE_HOME, "state.db")
     if os.path.exists(state_db):
+        sconn = None
         try:
             sconn = sqlite3.connect(state_db)
             sconn.row_factory = sqlite3.Row
@@ -2894,6 +1995,7 @@ def global_search(query: str, limit: int = 20):
             # Search kanban.db for tasks
             kanban_db = os.path.join(PROFILE_HOME, "kanban.db")
             if os.path.exists(kanban_db):
+                kconn = None
                 try:
                     kconn = sqlite3.connect(kanban_db)
                     kconn.row_factory = sqlite3.Row
@@ -2912,13 +2014,23 @@ def global_search(query: str, limit: int = 20):
                             "status": row["status"],
                             "relevance": 0.7,
                         })
-                    kconn.close()
                 except Exception:
                     pass
+                finally:
+                    if kconn is not None:
+                        try:
+                            kconn.close()
+                        except Exception:
+                            pass
 
-            sconn.close()
         except Exception:
             pass
+        finally:
+            if sconn is not None:
+                try:
+                    sconn.close()
+                except Exception:
+                    pass
 
     results.sort(key=lambda x: (x.get("relevance", 0), x.get("timestamp", "")), reverse=True)
     return results[:limit]
@@ -2989,15 +2101,17 @@ def get_recent_sessions(limit: int = 20):
     """List recent sessions from activity data."""
     _init_db()
     conn = _get_activity_conn()
-    rows = conn.execute(
-        """SELECT DISTINCT session_id, MIN(timestamp) as first_ts,
-                  MAX(timestamp) as last_ts, COUNT(*) as count
-           FROM activity WHERE session_id IS NOT NULL
-           GROUP BY session_id
-           ORDER BY last_ts DESC LIMIT ?""",
-        (limit,)
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT session_id, MIN(timestamp) as first_ts,
+                      MAX(timestamp) as last_ts, COUNT(*) as count
+               FROM activity WHERE session_id IS NOT NULL
+               GROUP BY session_id
+               ORDER BY last_ts DESC LIMIT ?""",
+            (limit,)
+        ).fetchall()
+    finally:
+        conn.close()
 
     sessions = []
     for row in rows:
@@ -3009,16 +2123,61 @@ def get_recent_sessions(limit: int = 20):
             "traces": [],
         })
 
-    # Add trace data for each session
+    # Attach trace-health aggregates (error / reasoning counts) per session so
+    # the list view can show health at a glance without a second round-trip.
     tconn = _get_trace_conn()
-    for session in sessions:
-        sid = session["session_id"]
-        traces = tconn.execute(
-            "SELECT * FROM traces WHERE session_id = ? ORDER BY timestamp ASC LIMIT 100",
-            (sid,)
+    try:
+        agg_rows = tconn.execute(
+            """SELECT session_id,
+                      SUM(CASE WHEN event_type='llm_call' THEN 1 ELSE 0 END) AS llm_count,
+                      COUNT(*) AS trace_count,
+                      SUM(CASE WHEN event_type='tool_call'
+                                AND (event_data LIKE '%"status":"error"%'
+                                     OR event_data LIKE '%"status": "error"%')
+                          THEN 1 ELSE 0 END) AS error_count
+               FROM traces WHERE session_id IS NOT NULL GROUP BY session_id""",
         ).fetchall()
-        session["traces"] = [dict(t) for t in traces]
-    tconn.close()
+        agg = {r["session_id"]: r for r in agg_rows}
+        for session in sessions:
+            sid = session["session_id"]
+            a = agg.get(sid)
+            session["llm_count"] = (a["llm_count"] or 0) if a else 0
+            session["trace_count"] = (a["trace_count"] or 0) if a else 0
+            session["error_count"] = (a["error_count"] or 0) if a else 0
+            session["has_errors"] = session["error_count"] > 0
+
+        # Add trace data for each session. Batched into ONE query instead of
+        # N+1 per-session round-trips (/trace/agents?limit=60 used to open 61
+        # trace queries per poll). The per-session LIMIT 100 contract is
+        # preserved by a window function; both spacing variants of the error
+        # status are matched exactly as in the aggregate above.
+        if sessions:
+            sids = [s["session_id"] for s in sessions if s["session_id"]]
+            if sids:
+                placeholders = ", ".join("?" * len(sids))
+                trace_rows = tconn.execute(
+                    f"""SELECT id, session_id, event_type, event_data,
+                               timestamp, depth, parent_id, duration_ms
+                        FROM (
+                            SELECT id, session_id, event_type, event_data,
+                                   timestamp, depth, parent_id, duration_ms,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY session_id
+                                       ORDER BY timestamp ASC
+                                   ) AS _rn
+                            FROM traces
+                            WHERE session_id IN ({placeholders})
+                        ) WHERE _rn <= 100
+                        ORDER BY session_id, timestamp ASC""",
+                    sids,
+                ).fetchall()
+                per_session: Dict[str, list] = {}
+                for t in trace_rows:
+                    per_session.setdefault(t["session_id"], []).append(dict(t))
+                for session in sessions:
+                    session["traces"] = per_session.get(session["session_id"], [])
+    finally:
+        tconn.close()
 
     return sessions
 
@@ -3071,6 +2230,33 @@ def register(ctx) -> None:
         description="Query Abyss observability data",
     )
 
+    # Register the named sub-commands + their slash aliases declared in
+    # plugin.yaml `commands:`. The runtime ignores that manifest field, so
+    # they must be registered explicitly to be invocable (e.g. /activity,
+    # /a-stats, /a-trace, and the dotted /abyss.recent forms).
+    _SUBCOMMAND_ALIASES = {
+        "abyss.recent": "recent",
+        "abyss.stats": "stats",
+        "abyss.search": "search",
+        "abyss.trace": "trace",
+        "abyss.incidents": "incidents",
+        "abyss.wave": "wave",
+        "activity": "recent",
+        "a-stats": "stats",
+        "a-search": "search",
+        "a-trace": "trace",
+        "a-incidents": "incidents",
+        "a-wave": "wave",
+    }
+    for _name, _sub in _SUBCOMMAND_ALIASES.items():
+        ctx.register_command(
+            _name,
+            handler=lambda raw_args, _s=_sub: _handle_slash(
+                f"{_s} {raw_args}".strip()
+            ),
+            description=f"Abyss {_sub} (alias)",
+        )
+
 
 def _handle_slash(raw_args: str) -> str:
     """Handle /abyss slash commands."""
@@ -3087,12 +2273,16 @@ Subcommands:
   health                       Show agent health score (0-100)
   trends [days] [hour|day]     Show activity/error/signal trends
   failures [limit]             Root-cause failure taxonomy
+  performance [days] [limit]   Latency percentiles (tools + models)
   search <query>              Search activity, memories, sessions
   trace <session>            Show trace timeline for a session
   signals [--session=<sid>]  Show detected signals
   incidents [--status=<st>]  Show incidents
   ack <signal_id>            Acknowledge a signal
   resolve <signal_id>        Resolve a signal
+  resolve-stale [days] [p]   Bulk-resolve stale signals (older than N days,
+                             optional session_id prefix, e.g. cron_; append
+                             'close' to close emptied incidents)
   resolve-agent <id>         Dispatch a free-Nous agent to diagnose + fix a signal/incident
   doctor                     Dispatch the doctor agent for a full diagnosis
   incident <id> <action>     Acknowledge/resolve/reopen/close an incident
@@ -3106,6 +2296,7 @@ Subcommands:
 
 Category filters:
   --category=<cat>  Filter recent by: cron, tool, llm, session, system
+  --session=<sid>   Filter recent to one session (drill-don't-rediscover)
 """
 
     sub = argv[0]
@@ -3113,13 +2304,16 @@ Category filters:
     if sub == "recent":
         n = 10
         category = None
+        session_id = None
         for arg in argv[1:]:
             if arg.startswith("--category="):
                 category = arg.split("=", 1)[1]
+            elif arg.startswith("--session="):
+                session_id = arg.split("=", 1)[1]
             elif arg.isdigit():
                 n = int(arg)
 
-        activities = list_activity(limit=n, category=category)
+        activities = list_activity(limit=n, category=category, session_id=session_id)
         if not activities:
             return "No activity entries found."
 
@@ -3270,6 +2464,32 @@ Category filters:
             return f"Signal {sig_id} not found."
         return f"✓ Signal #{sig_id} resolved ({row['signal_type']})."
 
+    if sub == "resolve-stale":
+        """Bulk-resolve old signals, e.g. /abyss resolve-stale 7 cron_
+
+        Syntax: /abyss resolve-stale [days] [session_prefix] [close]
+        - days: resolve signals older than N days (default 7)
+        - session_prefix: only signals whose session_id starts with this
+          (e.g. cron_ for overnight watcher noise)
+        - close: also close incidents left with zero open signals
+        """
+        days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 7
+        prefix = argv[2] if len(argv) > 2 else None
+        close_incidents = any(a == "close" for a in argv[3:]) if len(argv) > 3 else False
+        result = _resolve_signals_bulk(
+            session_prefix=prefix,
+            older_than_days=days,
+            close_empty_incidents=close_incidents,
+        )
+        if "error" in result:
+            return f"✗ {result['error']}"
+        lines = [f"✓ Bulk-resolved {result['resolved']} signal(s)"]
+        if result["signal_ids"]:
+            lines.append(f"  ids: {result['signal_ids'][:10]}{'...' if len(result['signal_ids']) > 10 else ''}")
+        if result["incidents_closed"]:
+            lines.append(f"  incidents closed: {result['incidents_closed']}")
+        return "\n".join(lines)
+
     if sub == "resolve-agent":
         """Dispatch a free-Nous agent to diagnose + fix: /abyss resolve-agent <signal|incident> <id>"""
         if len(argv) < 3 or argv[1] not in ("signal", "incident"):
@@ -3353,16 +2573,48 @@ Category filters:
                 lines.append(f"    - [{x['count']}x] {x['message'][:90]}")
         return "\n".join(lines) if len(lines) > 1 else "No failures recorded."
 
+    if sub == "performance":
+        """Show latency percentiles: /abyss performance [days] [limit]"""
+        days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 7
+        limit = int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 10
+        p = get_performance(days=days, limit=limit)
+        lines = [f"Abyss performance (last {days}d):"]
+        lines.append(
+            f"  totals: {p['totals']['tool_calls']} tool calls "
+            f"({p['totals']['tool_errors']} errors), "
+            f"{p['totals']['llm_requests']} LLM requests "
+            f"({p['totals']['llm_errors']} errors)"
+        )
+        if p["tools"]:
+            lines.append("  Slowest tools (p95 ms):")
+            for t in p["tools"][:5]:
+                lines.append(
+                    f"    {t['tool']}: p50={t['p50_ms']} p95={t['p95_ms']} "
+                    f"max={t['max_ms']} ({t['count']} calls)"
+                )
+        if p["models"]:
+            lines.append("  Slowest models (p95 ms):")
+            for m in p["models"][:5]:
+                lines.append(
+                    f"    {m['model']} ({m['provider']}): p50={m['p50_ms']} "
+                    f"p95={m['p95_ms']} max={m['max_ms']} "
+                    f"({m['count']} reqs)"
+                )
+        return "\n".join(lines) if len(lines) > 2 else "No performance data in window."
+
     if sub == "export":
         """Dump all data as JSON: /abyss export"""
         data = export_data()
-        return json.dumps({
+        summary = {
             "activity": len(data["activity"]),
             "signals": len(data["signals"]),
             "incidents": len(data["incidents"]),
             "traces": len(data["traces"]),
+            "wave": {k: len(v) for k, v in data.get("wave", {}).items()
+                     if k != "_missing"},
             "exported_at": data["exported_at"],
-        })
+        }
+        return json.dumps(summary)
 
     if sub == "webhook":
         """Check or set webhook alerting: /abyss webhook [url] | /abyss webhook off"""
@@ -3402,7 +2654,18 @@ Category filters:
         tconn.commit()
         tconn.close()
 
-        return "✓ All activity, signals, incidents, and trace data cleared."
+        # Aug-2026 wave tables live on the same activity DB; a "clear all
+        # data" that leaves stream/API/approval history behind is a half-wipe.
+        _wave_cleared = {}
+        try:
+            from abyss_wave import clear_wave_data
+
+            _wave_cleared = clear_wave_data()
+        except Exception as exc:
+            logger.debug("Abyss wave clean skipped: %s", exc)
+
+        return ("✓ All activity, signals, incidents, trace, and wave data "
+                f"cleared{(' (' + ', '.join(f'{k}={v}' for k, v in _wave_cleared.items() if v) + ' rows)') if _wave_cleared else ''}.")
 
     if sub == "wave":
         """August 2026 wave surfaces: events, streams, api, subagents, approvals,

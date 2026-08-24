@@ -7,19 +7,22 @@ core module (plugins/abyss/__init__.py -> handle_request), which owns the
 SQLite storage, hook handlers, signal classifiers, and incident clustering.
 
 Endpoints:
-  GET  /activity                List activity entries (limit, category, since)
+  GET  /activity                List activity entries (limit, category, since, session_id)
   POST /activity                Add an activity entry
   GET  /calendar                Scheduled cron tasks + activity in range
   GET  /search                  Global search (q, limit)
   GET  /stats                   Dashboard summary
   GET  /trace                   Session trace or session list (session_id, limit)
+  GET  /trace/graph             Graph-node (DAG) view of a session trajectory
+  GET  /trace/timeline          Per-lane timeline of one session
+  GET  /trace/agents            Overview: every agent (session) as its own lane
   GET  /graph                   Brain graph node/edge data (limit)
   GET  /health                  Agent health score (0-100)
   GET  /trends                  Bucketed activity/error/signal/incident trends
   GET  /failures                Root-cause failure taxonomy (type/tool/message)
   GET  /export                  Full JSON snapshot of all Abyss tables
-  GET  /status                  Lightweight status for the statusbar chip
-  GET  /signals                 Detected signals (session_id, limit)
+  GET  /status                  Lightweight status for the statusbar chip (incl. last_activity_at/last_signal_at/last_error_at liveness timestamps)
+  GET  /signals                 Detected signals (session_id, limit; each row enriched with tool_name/tool_action via activity join)
   GET  /incidents               Clustered incidents (status, limit)
   POST /signals/self-diagnostic Record an agent self-diagnostic
   POST /incidents/cluster       Run incident clustering
@@ -34,7 +37,13 @@ Endpoints:
   POST /incidents/{id}/resolve-agent Dispatch a free-Nous agent to diagnose + fix an incident
   POST /doctor/run                 Dispatch the doctor agent (full diagnosis)
   GET  /doctor/report              Poll the doctor report (report_id)
+  GET  /doctor/log                 Stream the live tail of the doctor agent's log (report_id)
+  GET  /doctor/last                Return the most recent completed doctor report
   POST /doctor/approve             Approve + apply the doctor's proposed fixes
+  POST /benchmark/run              Run the Abyss Bench Layer 1 probe suite
+  POST /prune-resolutions          Hygiene: delete old resolution artifacts
+  GET  /wave/events|streams|api|subagents|approvals|commands|platform|skills|summary
+  POST /wave/emit                  Publish an event on the abyss: event bus
 """
 
 from __future__ import annotations
@@ -113,8 +122,9 @@ async def get_activity(
     limit: int = 50,
     category: Optional[str] = None,
     since: Optional[str] = None,
+    session_id: Optional[str] = None,
 ):
-    return _delegate("GET", "/activity", {"limit": limit, "category": category, "since": since})
+    return _delegate("GET", "/activity", {"limit": limit, "category": category, "since": since, "session_id": session_id})
 
 
 @router.post("/activity")
@@ -159,6 +169,11 @@ async def failures(limit: int = 15):
     return _delegate("GET", "/failures", {"limit": limit})
 
 
+@router.get("/performance")
+async def performance(days: int = 7, limit: int = 20):
+    return _delegate("GET", "/performance", {"days": days, "limit": limit})
+
+
 @router.get("/export")
 async def export_all():
     return _delegate("GET", "/export")
@@ -174,6 +189,24 @@ async def status():
 @router.get("/trace")
 async def trace(session_id: Optional[str] = None, limit: int = 200):
     return _delegate("GET", "/trace", {"session_id": session_id or "", "limit": limit})
+
+
+@router.get("/trace/graph")
+async def trace_graph(session_id: str = "", limit: int = 300):
+    """Graph-node (DAG) view of a session trajectory — Raindrop-style."""
+    return _delegate("GET", "/trace/graph", {"session_id": session_id, "limit": limit})
+
+
+@router.get("/trace/timeline")
+async def trace_timeline(session_id: str = "", limit: int = 300):
+    """Per-lane timeline of one session (agent trajectory as a timeline)."""
+    return _delegate("GET", "/trace/timeline", {"session_id": session_id, "limit": limit})
+
+
+@router.get("/trace/agents")
+async def trace_agents(limit: int = 60):
+    """Overview: every agent (session) as its own timeline lane."""
+    return _delegate("GET", "/trace/agents", {"limit": limit})
 
 
 # --- graph ------------------------------------------------------------------
@@ -194,6 +227,13 @@ async def signals(session_id: Optional[str] = None, limit: int = 50):
 async def self_diagnostic(request: Request):
     data = await _json_body(request)
     return _delegate("POST", "/signals/self-diagnostic", body=json.dumps(data))
+
+
+@router.post("/signals/resolve-bulk")
+async def resolve_signals_bulk(request: Request):
+    """Bulk-resolve stale signals (triage semantics) — see /signals/resolve-bulk."""
+    data = await _json_body(request)
+    return _delegate("POST", "/signals/resolve-bulk", body=json.dumps(data))
 
 
 @router.post("/signals/{signal_id}/acknowledge")
@@ -266,6 +306,12 @@ async def doctor_report(report_id: str = ""):
 async def doctor_last():
     """Return the most recent completed doctor report (resume support)."""
     return _delegate("GET", "/doctor/last")
+
+
+@router.get("/doctor/log")
+async def doctor_log(report_id: str = ""):
+    """Stream the live tail of the spawned doctor agent's stdout log."""
+    return _delegate("GET", "/doctor/log", {"report_id": report_id})
 
 
 @router.post("/benchmark/run")

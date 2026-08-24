@@ -956,6 +956,36 @@ def _run_script():
     sh_helper = _handle_slash("help")
     check("help lists resolve-stale", "resolve-stale" in sh_helper, sh_helper[:200])
 
+    # 5b) --type filter reaches the API: resolve only the empty_stream flood,
+    #     leaving other signal types untouched.
+    _tconn = __init__._get_activity_conn()
+    es_id = _tconn.execute(
+        "INSERT INTO signals (timestamp, signal_type, severity, label, description, session_id, source, acknowledged, resolved) "
+        "VALUES (?, 'empty_stream', 'warning', 'x', 'x', 'flood-sess', 'wave', 0, 0)",
+        (old,),
+    ).lastrowid
+    _tconn.commit()
+    _tconn.close()
+    sh_t = _handle_slash("resolve-stale 1 --type empty_stream")
+    check("/abyss resolve-stale --type filter", "Bulk-resolved" in sh_t and "1" in sh_t, sh_t[:160])
+    _tconn = __init__._get_activity_conn()
+    es_row = _tconn.execute("SELECT resolved FROM signals WHERE id = ?", (es_id,)).fetchone()
+    _tconn.close()
+    check("resolve-stale --type leaves other types", es_row["resolved"] == 1, str(dict(es_row)))
+
+    # 5c) back-compat: legacy positional prefix + --type + close together.
+    _tconn = __init__._get_activity_conn()
+    to_id = _tconn.execute(
+        "INSERT INTO signals (timestamp, signal_type, severity, label, description, session_id, source, acknowledged, resolved) "
+        "VALUES (?, 'timeout', 'warning', 'x', 'x', 'cron_5', 'classifier', 0, 0)",
+        (old,),
+    ).lastrowid
+    _tconn.commit()
+    _tconn.close()
+    sh_t2 = _handle_slash("resolve-stale 1 cron_5 --type timeout --close")
+    check("resolve-stale legacy prefix + --type + close",
+          "Bulk-resolved" in sh_t2 and "1" in sh_t2, sh_t2[:160])
+
     print("=== 17. Status liveness metadata (last-activity / last-signal / last-error) ===")
     reset_db()
     st_empty = get_status()

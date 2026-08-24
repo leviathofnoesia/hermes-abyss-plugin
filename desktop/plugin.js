@@ -50,7 +50,7 @@ import {
   Tabs, TabsList, TabsTrigger, GlyphSpinner
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useEffect, useState, useMemo, useCallback, useRef } from 'react'
+import { useEffect, useState, useMemo, useCallback, useRef, Component } from 'react'
 
 const ID = 'abyss'
 
@@ -4113,6 +4113,54 @@ function loadSavedTab() {
   return 'brain'
 }
 
+// Render-crash containment (tick-51): fetch errors have been first-class since
+// tick-1 ("errors never masquerade as empty"), but a crash during RENDER — a
+// malformed API shape hitting an unguarded property, a canvas renderer throwing
+// — had no containment at all: the error propagated out of AbyssDashboard and
+// blanked the entire dashboard surface, tabs included, with zero recovery short
+// of reloading the app. ViewBoundary is a per-active-view React error boundary:
+// it latches the failure, renders the SDK ErrorState in the view's own slot
+// (tabs, masthead, and status strip stay alive), and offers two recovery paths —
+// 'Retry view' remounts the same view, and simply switching tabs clears the
+// latch via componentDidUpdate so returning re-mounts fresh. The boundary is
+// keyed on activeTab so the latch never leaks across views.
+class ViewBoundary extends Component {
+  constructor(props) {
+    super(props)
+    this.state = { err: null }
+  }
+  static getDerivedStateFromError(err) {
+    return { err }
+  }
+  componentDidCatch(err, info) {
+    // Console breadcrumb for diagnosis; the UI itself stays in-theme.
+    try { console.error('[abyss] view crashed:', err, info && info.componentStack) } catch { /* console unavailable */ }
+  }
+  componentDidUpdate(prevProps) {
+    // Tab change is the natural recovery path: clear the latch so the newly
+    // selected view mounts fresh instead of inheriting the previous view's
+    // failure state.
+    if (prevProps.viewKey !== this.props.viewKey && this.state.err) {
+      this.setState({ err: null })
+    }
+  }
+  render() {
+    if (this.state.err) {
+      const msg = String((this.state.err && this.state.err.message) || this.state.err || 'unknown render error')
+      return jsx('div', {
+        className: 'h-full flex items-center justify-center p-4',
+        children: jsx(ErrorState, {
+          title: 'View crashed',
+          description: msg,
+          children: jsx(Button, { variant: 'secondary', size: 'sm', onClick: () => this.setState({ err: null }), children: 'Retry view' })
+        })
+      })
+    }
+    return this.props.children
+  }
+}
+
+
 function AbyssDashboard({ ctx }) {
   const [activeTab, setActiveTab] = useState(() => loadSavedTab())
   // Every tab change funnels through here (manual click, StatusStrip drill,
@@ -4181,14 +4229,16 @@ function AbyssDashboard({ ctx }) {
           }),
           jsx('div', {
             className: 'flex-1 min-h-0 overflow-hidden',
-            children: activeTab === 'brain' ? jsx(BrainGraph, { ctx, onOpenTrace: openTrace })
-              : activeTab === 'signals' ? jsx(SignalsIncidentsView, { ctx, onOpenTrace: openTrace })
-              : activeTab === 'health' ? jsx(HealthView, { ctx })
-              : activeTab === 'activity' ? jsx(ActivityFeed, { ctx, onOpenTrace: openTrace })
-              : activeTab === 'tracing' ? jsx(TracingView, { ctx, presetSessionId: tracePreset, onPresetConsumed: clearTracePreset })
-              : activeTab === 'wave' ? jsx(WaveView, { ctx })
-              : activeTab === 'search' ? jsx(GlobalSearch, { ctx, onOpenTrace: openTrace })
-              : jsx(CalendarView, { ctx, onOpenTrace: openTrace })
+            children: jsx(ViewBoundary, { viewKey: activeTab,
+              children: activeTab === 'brain' ? jsx(BrainGraph, { ctx, onOpenTrace: openTrace })
+                : activeTab === 'signals' ? jsx(SignalsIncidentsView, { ctx, onOpenTrace: openTrace })
+                : activeTab === 'health' ? jsx(HealthView, { ctx })
+                : activeTab === 'activity' ? jsx(ActivityFeed, { ctx, onOpenTrace: openTrace })
+                : activeTab === 'tracing' ? jsx(TracingView, { ctx, presetSessionId: tracePreset, onPresetConsumed: clearTracePreset })
+                : activeTab === 'wave' ? jsx(WaveView, { ctx })
+                : activeTab === 'search' ? jsx(GlobalSearch, { ctx, onOpenTrace: openTrace })
+                : jsx(CalendarView, { ctx, onOpenTrace: openTrace })
+            })
           })
         ]
       })
@@ -5749,3 +5799,26 @@ export default {
 // fetch paths touched, zero class tokens added. Verified post-edit: node
 // --input-type=module --check PASS + CJS check OK; string-aware brace/paren
 // balance clean; no backend/Python touched.
+//
+// night-shift-tick-51 (this shift): render-crash containment via ViewBoundary.
+// Fetch errors have been first-class since tick-1 ("errors never masquerade
+// as empty"), but a crash during RENDER — a malformed API shape hitting an
+// unguarded property, a canvas renderer throwing — had no containment: the
+// error propagated out of AbyssDashboard and blanked the entire dashboard,
+// tabs included, with no recovery short of reloading the app (no error
+// boundary existed anywhere in the file). Now:
+//   1. ViewBoundary — a per-active-view React error boundary (class component;
+//      'react' import gained Component) wrapping the conditional view switch
+//      inside AbyssDashboard. It latches getDerivedStateFromError, logs a
+//      console breadcrumb via componentDidCatch, and renders the SDK
+//      ErrorState ('View crashed' + message + 'Retry view') IN THE VIEW'S OWN
+//      SLOT — tabs, masthead, StatusStrip, and statusbar chip all stay alive.
+//   2. Two recovery paths: 'Retry view' clears the latch (remount); switching
+//      tabs clears it too, so returning to a view mounts fresh instead of
+//      inheriting another view's failure. Boundary keyed on activeTab so a
+//      latch never leaks across views.
+// Zero fetch paths touched; ErrorState/Button contract matches existing
+// usage ({title, description, children}). Verified post-edit: ESM + CJS
+// syntax checks PASS, string-aware brace balance clean, simulated boundary
+// lifecycle (latch → retry → tab-switch clear) passes. No backend/Python
+// touched.

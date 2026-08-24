@@ -872,11 +872,16 @@ function StatusStrip({ ctx, onNavigate }) {
   const items = [
     // fmtCount (tick-47): lifetime totals (ACT/SIG) exceed four digits —
     // group them. HLTH stays raw: a 0–100 score never needs a separator.
-    { label: 'ACT', value: fmtCount(stats?.total_activities ?? 0), tone: 'text-(--ui-text-primary)', hint: 'total activity entries recorded' },
+    // Tick-49 full drill coverage: previously only HLTH/SIG were jump-points
+    // while their neighbours sat as dead text — yet each of them also maps
+    // 1:1 onto a view (ACT/CAT → activity feed, INC → watch's incidents
+    // half, CRN → calendar where tracked cron jobs render). Same
+    // drill-don't-rediscover contract for the whole strip now.
+    { label: 'ACT', value: fmtCount(stats?.total_activities ?? 0), tone: 'text-(--ui-text-primary)', nav: 'activity', hint: 'total activity entries recorded · click to open activity' },
     { label: 'HLTH', value: healthScore ?? '—', tone: healthScore != null ? healthTone : 'text-(--ui-text-tertiary)', nav: 'health', hint: 'current health score (0–100) · click to open health' },
-    { label: 'INC', value: fmtCount(status?.incidents_open ?? 0), tone: (status?.incidents_open ?? 0) > 0 ? 'text-(--ui-yellow)' : 'text-(--ui-text-primary)', hint: 'open clustered incidents' },
-    { label: 'CRN', value: fmtCount(stats?.cron_jobs ?? 0), tone: 'text-(--ui-text-primary)', hint: 'active cron jobs tracked' },
-    { label: 'CAT', value: fmtCount(stats?.categories ? Object.keys(stats.categories).length : 0), tone: 'text-(--ui-text-primary)', hint: 'distinct activity categories recorded' },
+    { label: 'INC', value: fmtCount(status?.incidents_open ?? 0), tone: (status?.incidents_open ?? 0) > 0 ? 'text-(--ui-yellow)' : 'text-(--ui-text-primary)', nav: 'signals', hint: 'open clustered incidents · click to open watch' },
+    { label: 'CRN', value: fmtCount(stats?.cron_jobs ?? 0), tone: 'text-(--ui-text-primary)', nav: 'calendar', hint: 'active cron jobs tracked · click to open calendar' },
+    { label: 'CAT', value: fmtCount(stats?.categories ? Object.keys(stats.categories).length : 0), tone: 'text-(--ui-text-primary)', nav: 'activity', hint: 'distinct activity categories recorded · click to open activity' },
     { label: 'SIG', value: fmtCount(openSignals), tone: criticals > 0 ? 'text-(--ui-red)' : openSignals > 0 ? 'text-(--ui-yellow)' : 'text-(--ui-green)', nav: 'signals', hint: 'open signals (silent agent failures) · click to open watch' }
   ]
 
@@ -937,8 +942,9 @@ function StatusStrip({ ctx, onNavigate }) {
               jsx('span', { className: cn('text-xs font-semibold abyss-mono tabular-nums', item.tone), title: item.hint, children: item.value }),
               jsx('span', { className: 'abyss-micro uppercase tracking-widest text-(--ui-text-quaternary)', children: item.label })
             ]
-            // The glance must connect to the action: SIG and HLTH are live
-            // jump-points into the watch / health views (drill-don't-rediscover).
+            // The glance must connect to the action: since tick-49 every tile
+            // is a live jump-point (ACT/CAT→activity, HLTH→health, INC/SIG→
+            // watch, CRN→calendar — drill-don't-rediscover across the board).
             if (item.nav && onNavigate) {
               return jsx(Button, {
                 key: item.label,
@@ -5671,3 +5677,27 @@ export default {
 // hoisted above WaveView). Verified post-edit: node --input-type=module
 // --check PASS + CJS check OK; string-aware brace/paren balance clean;
 // no backend/Python touched.
+//
+// night-shift-tick-49 (this shift): StatusStrip full drill coverage — every
+// tile is now a live jump-point. The strip's own doctrine is
+// drill-don't-rediscover, but only HLTH and SIG honored it: ACT (total
+// activity), INC (open incidents), CRN (tracked cron jobs) and CAT (distinct
+// categories) sat as dead text even though each maps 1:1 onto a view —
+// INC's rows render in the watch tab next to SIG's, CRN's cron jobs render
+// in the calendar grid, and ACT/CAT are exactly what the activity feed and
+// its category filter show. Now:
+//   1. ACT + CAT → activity feed.
+//   2. INC → watch (its incidents half; same target as the verdict button).
+//   3. CRN → calendar (where tracked cron jobs render as weekly entries).
+//   4. Hints updated to '· click to open <view>' so the affordance is
+//      discoverable on hover; aria-labels derive from nav automatically.
+// The generic item.nav branch already renders tiles as Buttons with proper
+// roles/labels, so no new render code — data-only change plus comment truthing.
+// Also re-ran the host-bundle drift sweep against the CURRENT stylesheet hash
+// (index-ChgG27Ex.css, regenerated since tick-22's BwB1iTEf audit): all 157
+// distinct class tokens compile (v2 matcher matches tailwind's literal
+// backslash-escaped selectors), all 11 codicon names present, all 9 abyss-*
+// helpers defined in CONSOLE_CSS. Zero drift.
+// Verified post-edit: node --input-type=module --check PASS + CJS check OK;
+// string-aware brace/paren balance clean; hook order / import surface
+// untouched. No backend/Python touched.

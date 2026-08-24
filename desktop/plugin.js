@@ -3906,12 +3906,12 @@ function WaveView({ ctx }) {
       ;(api || []).forEach(r => items.push({
         ts: r.timestamp, tag: 'api',
         text: `${r.provider || '?'} ${r.model || ''}`.trim(),
-        sub: `${r.status || ''} ${r.finish_reason || ''} ${r.duration_ms != null ? r.duration_ms + 'ms' : ''}`.trim()
+        sub: `${r.status || ''} ${r.finish_reason || ''} ${r.duration_ms != null ? fmtDur(r.duration_ms) : ''}`.trim()
       }))
       ;(subagents || []).forEach(r => items.push({
         ts: r.timestamp, tag: 'subagents',
         text: `${r.child_role || 'subagent'} ${r.child_session_id ? r.child_session_id.slice(0, 8) : ''}`.trim(),
-        sub: `${r.status || ''} ${r.duration_ms != null ? r.duration_ms + 'ms' : ''}`.trim()
+        sub: `${r.status || ''} ${r.duration_ms != null ? fmtDur(r.duration_ms) : ''}`.trim()
       }))
       ;(approvals || []).forEach(r => items.push({
         ts: r.timestamp, tag: 'approvals',
@@ -3920,8 +3920,8 @@ function WaveView({ ctx }) {
       }))
       ;(streams || []).forEach(r => items.push({
         ts: r.timestamp, tag: 'streams',
-        text: `${r.provider || '?'} ${r.model || ''} ${r.chars || 0} chars`.trim(),
-        sub: `${r.deltas || 0} deltas ${r.error ? 'error' : ''}`.trim()
+        text: `${r.provider || '?'} ${r.model || ''} ${fmtCount(r.chars || 0)} chars`.trim(),
+        sub: `${fmtCount(r.deltas || 0)} deltas ${r.error ? 'error' : ''}`.trim()
       }))
       ;(commands || []).forEach(r => items.push({
         ts: r.timestamp, tag: 'commands',
@@ -4009,7 +4009,7 @@ function WaveView({ ctx }) {
                   jsx('span', { className: 'inline-block h-1.5 w-1.5 rounded-full shrink-0', style: { backgroundColor: s.tone }, children: '' }),
                   jsx('span', { className: 'abyss-tiny uppercase tracking-wider truncate', style: { color: s.tone }, children: s.label })
                 ]}),
-                jsx('span', { className: 'w-16 text-right text-xs abyss-mono tabular-nums text-(--ui-text-primary)', title: pending ? 'loading…' : summaryDown ? 'summary link down — counts unavailable' : undefined, children: pending ? '·' : summaryDown ? '—' : (info ? info.count : 0) }),
+                jsx('span', { className: 'w-16 text-right text-xs abyss-mono tabular-nums text-(--ui-text-primary)', title: pending ? 'loading…' : summaryDown ? 'summary link down — counts unavailable' : undefined, children: pending ? '·' : summaryDown ? '—' : fmtCount(info ? info.count : 0) }),
                 jsx('span', { className: 'w-16 text-right abyss-tiny abyss-mono tabular-nums text-(--ui-text-quaternary)', title: info && info.last ? timeTitle(info.last) : undefined, children: pending ? '·' : (info && info.last ? relativeTime(info.last) : '—') })
               ]
             })
@@ -5654,3 +5654,20 @@ export default {
 // tokens added. Verified post-edit: node --input-type=module --check PASS +
 // CJS check OK; string-aware brace/paren balance clean; no backend/Python
 // touched.
+//
+// night-shift-tick-48 (this shift): Wave feed human-readable durations and
+// counts — the WaveView merged feed and surface-counter table were the last
+// views still printing raw units. API/subagent rows printed LLM call
+// durations as raw milliseconds ('125000ms'), stream rows printed char and
+// delta totals as ungrouped digits ('128400 chars · 512 deltas'), and the
+// surface table's lifetime count cell printed e.g. '25875' — all while every
+// other view already speaks fmtDur() ('2m 5s') and fmtCount() ('25,875',
+// tick-47). Now:
+//   1. api + subagents feed rows use fmtDur(r.duration_ms).
+//   2. streams rows wrap chars/deltas in fmtCount().
+//   3. surface-counter count cell wraps info.count in fmtCount().
+// Sub-second durations ('450ms') and sub-1,000 counts are byte-identical.
+// Zero new imports, zero hooks (fmtDur/fmtCount are module-scope helpers,
+// hoisted above WaveView). Verified post-edit: node --input-type=module
+// --check PASS + CJS check OK; string-aware brace/paren balance clean;
+// no backend/Python touched.

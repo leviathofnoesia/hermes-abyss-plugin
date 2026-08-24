@@ -1754,6 +1754,20 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
         elif path == "/doctor/log" and method == "GET":
             return _doctor_log(params.get("report_id", ""))
 
+        elif path == "/doctor/capture" and method == "GET":
+            # Deterministic multi-store capture liveness (no agent dispatch):
+            # freshness + fragmentation verdict across every known
+            # abyss-data/activity.db (active profile, home fallback, siblings).
+            from abyss_doctor import _capture_status
+
+            try:
+                staleness = float(params.get("max_age_hours") or 6.0)
+            except (TypeError, ValueError):
+                return {"error": "max_age_hours must be a number", "code": 400}
+            if staleness <= 0:
+                return {"error": "max_age_hours must be > 0", "code": 400}
+            return _capture_status(staleness_hours=staleness)
+
         elif path == "/doctor/last" and method == "GET":
             return _doctor_last()
 

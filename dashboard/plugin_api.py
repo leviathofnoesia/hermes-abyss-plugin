@@ -334,6 +334,13 @@ async def doctor_log(report_id: str = ""):
     return _delegate("GET", "/doctor/log", {"report_id": report_id})
 
 
+@router.get("/doctor/capture")
+async def doctor_capture(max_age_hours: float = 6.0):
+    """Multi-store capture liveness: per-store freshness + a verdict of
+    ok / fragmented / outage / no_data across every known abyss-data store."""
+    return _delegate("GET", "/doctor/capture", {"max_age_hours": max_age_hours})
+
+
 @router.post("/benchmark/run")
 async def benchmark_run():
     """Run the Abyss Bench Layer 1 probe suite (deterministic regression gate)."""

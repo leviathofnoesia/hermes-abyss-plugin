@@ -16,13 +16,140 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger("hermes.plugins.abyss.doctor")
+
+
+def _capture_status(staleness_hours: float = 6.0,
+                    hermes_home=None,
+                    profile_home=None) -> dict:
+    """Inventory every known Abyss activity store and its capture freshness.
+
+    The plugin resolves its data dir from ``HERMES_PROFILE_HOME`` **at import
+    time**. Any Hermes process launched without that env var (cron runners,
+    spawned subagents, the web server under a different launcher) falls back
+    to ``<HERMES_HOME>/abyss-data`` and silently writes there instead —
+    splitting observability data across stores. Found live 2026-08-24: the
+    kraken profile store went stale at 10:39 while the global fallback store
+    kept capturing the very same sessions, so every single-store health view
+    looked dead (or blind) depending on which copy you queried.
+
+    This check surfaces the two failure classes a single-store view cannot
+    see, deterministically (no agent dispatch):
+
+    - ``outage``      — no store received any row within ``staleness_hours``
+                        (hooks dropped, plugin misloaded, gateway down).
+    - ``fragmented``  — more than one store was written recently
+                        (split-brain: captures are landing in different DBs).
+    """
+    from __init__ import HERMES_HOME, PROFILE_HOME
+
+    home = Path(hermes_home) if hermes_home else Path(HERMES_HOME)
+    prof = Path(profile_home) if profile_home else Path(PROFILE_HOME)
+
+    # Ordered candidates, deduped by absolute path: the ACTIVE store first
+    # (where THIS process would write), then the global fallback, then every
+    # sibling profile store discovered under <home>/profiles/.
+    candidates = []
+    seen = set()
+
+    def _add(label, path):
+        try:
+            key = os.path.abspath(str(path))
+        except Exception:
+            key = str(path)
+        if key not in seen:
+            seen.add(key)
+            candidates.append((label, path))
+
+    _add("active", prof / "abyss-data" / "activity.db")
+    _add("home-fallback", home / "abyss-data" / "activity.db")
+    try:
+        for child in sorted((home / "profiles").iterdir()):
+            _add("profile:" + child.name,
+                 child / "abyss-data" / "activity.db")
+    except OSError:
+        pass  # no profiles dir — global-only install
+
+    now = datetime.now()
+    cutoff_24h = (now - timedelta(hours=24)).isoformat()
+    stores = []
+    for label, db_path in candidates:
+        entry = {
+            "label": label,
+            "path": str(db_path),
+            "exists": db_path.is_file(),
+            "last_capture": None,
+            "age_hours": None,
+            "rows_24h": None,
+        }
+        if entry["exists"]:
+            try:
+                con = sqlite3.connect(
+                    "file:" + db_path.as_posix() + "?mode=ro",
+                    uri=True, timeout=2)
+                con.execute("PRAGMA busy_timeout = 2000")
+                try:
+                    last = con.execute(
+                        "SELECT MAX(timestamp) FROM activity").fetchone()[0]
+                    entry["rows_24h"] = con.execute(
+                        "SELECT COUNT(*) FROM activity WHERE timestamp >= ?",
+                        (cutoff_24h,)).fetchone()[0]
+                finally:
+                    con.close()
+                if last:
+                    entry["last_capture"] = last
+                    entry["age_hours"] = round(
+                        (now - datetime.fromisoformat(last)).total_seconds()
+                        / 3600.0, 3)
+            except Exception as exc:
+                entry["error"] = str(exc)[:200]
+        stores.append(entry)
+
+    fresh = [s for s in stores if s["age_hours"] is not None]
+    if not fresh:
+        verdict = "no_data"
+    elif len([s for s in fresh
+              if s["age_hours"] <= staleness_hours]) >= 2:
+        verdict = "fragmented"
+    elif min(s["age_hours"] for s in fresh) > staleness_hours:
+        verdict = "outage"
+    else:
+        verdict = "ok"
+
+    freshest = min(fresh, key=lambda s: s["age_hours"]) if fresh else None
+    if verdict == "ok":
+        summary = ("All captures flowing into one store ("
+                   + freshest["label"] + ", "
+                   + str(freshest["age_hours"]) + "h ago).")
+    elif verdict == "fragmented":
+        recent = [s["label"] for s in fresh if s["age_hours"] <= staleness_hours]
+        summary = ("Split-brain: " + str(len(recent)) + " stores written within "
+                   + str(staleness_hours) + "h (" + ", ".join(recent)
+                   + ") — processes are capturing into DIFFERENT databases; "
+                     "consolidate HERMES_PROFILE_HOME usage.")
+    elif verdict == "outage":
+        summary = ("No capture anywhere for "
+                   + str(round(min(s["age_hours"] for s in fresh), 1))
+                   + "h (freshest: " + freshest["label"]
+                   + ") — hooks dropped, plugin not loaded, or agent idle.")
+    else:
+        summary = "No Abyss activity store has any rows yet."
+    return {
+        "status": verdict,
+        "summary": summary,
+        "active_store": str(prof / "abyss-data" / "activity.db"),
+        "staleness_hours": staleness_hours,
+        "stores": stores,
+        "checked_at": now.isoformat(),
+    }
 
 
 def _doctor_context() -> dict:
@@ -50,6 +177,11 @@ def _doctor_context() -> dict:
         "open_signals": [_redact(s) for s in signals],
         "open_incidents": [_redact(i) for i in incidents],
         "recent_errors": [_redact(e) for e in errors],
+        # Multi-store capture liveness (added 2026-08-24): the doctor agent
+        # must know whether observability itself is healthy BEFORE trusting
+        # the single-store signal/incident view above — a stale or split
+        # capture layer invalidates every other finding.
+        "capture": _capture_status(),
     }
 
 

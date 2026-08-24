@@ -1108,6 +1108,100 @@ def _run_script():
     h = _handle_slash("signals --type=no_such_type_xyz")
     check("slash signals non-matching type -> empty message", "No signals detected" in h, h[:120])
 
+    # --- capture liveness + store fragmentation (/doctor/capture) -----------
+    # Added 2026-08-24 after a live split-brain: the kraken profile store went
+    # stale while the global fallback store kept capturing the same sessions,
+    # and NO single-store view could tell. _capture_status inventories every
+    # known activity.db and classifies: ok / fragmented / outage / no_data.
+    print("\nSection: multi-store capture liveness")
+    import sqlite3 as _sqlite3
+    from datetime import datetime as _dt, timedelta as _td
+    from abyss_doctor import _capture_status
+
+    def _mk_store(home_root, rel, minutes_ago_start, gap_minutes=10, n=2):
+        d = Path(home_root) / rel
+        d.mkdir(parents=True, exist_ok=True)
+        conn = _sqlite3.connect(str(d / "activity.db"))
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS activity "
+            "(id INTEGER PRIMARY KEY, timestamp TEXT)")
+        base = _dt.now() - _td(minutes=minutes_ago_start)
+        for i in range(n):
+            conn.execute(
+                "INSERT INTO activity (timestamp) VALUES (?)",
+                ((base - _td(minutes=gap_minutes * i)).isoformat(),))
+        conn.commit()
+        conn.close()
+
+    def _scenario(name):
+        return Path(tempfile.mkdtemp(prefix="abyss-cap-" + name + "-"))
+
+    # 1. empty install -> no_data
+    root_a = _scenario("a")
+    r = _capture_status(
+        hermes_home=root_a / "home",
+        profile_home=root_a / "home" / "profiles" / "kraken")
+    check("capture: empty install -> no_data", r["status"] == "no_data", r["summary"][:70])
+    check("capture: no_data lists candidate stores", len(r["stores"]) >= 1 and
+          all(not s["exists"] for s in r["stores"]), str(len(r["stores"])))
+
+    # 2. single fresh active store -> ok
+    root_b = _scenario("b")
+    _mk_store(root_b / "home" / "profiles" / "kraken", "abyss-data", minutes_ago_start=5)
+    r = _capture_status(
+        hermes_home=root_b / "home",
+        profile_home=root_b / "home" / "profiles" / "kraken")
+    check("capture: single fresh store -> ok", r["status"] == "ok", r["summary"][:70])
+    active_entry = next((s for s in r["stores"] if s["label"] == "active"), None)
+    check("capture: active store freshness computed",
+          active_entry is not None and active_entry["rows_24h"] == 2
+          and active_entry["age_hours"] is not None and active_entry["age_hours"] < 1,
+          str(active_entry))
+
+    # 3. everything stale -> outage; wider window relaxes to ok
+    root_c = _scenario("c")
+    _mk_store(root_c / "home" / "profiles" / "kraken", "abyss-data",
+              minutes_ago_start=600)  # 10h old, gaps push older still
+    prof_c = root_c / "home" / "profiles" / "kraken"
+    r = _capture_status(hermes_home=root_c / "home", profile_home=prof_c)
+    check("capture: all stores stale -> outage", r["status"] == "outage", r["summary"][:70])
+    r = _capture_status(staleness_hours=48.0, hermes_home=root_c / "home", profile_home=prof_c)
+    check("capture: wider staleness window -> ok again", r["status"] == "ok", r["status"])
+
+    # 4. two fresh stores -> fragmented (split-brain)
+    root_d = _scenario("d")
+    _mk_store(root_d / "home", "abyss-data", minutes_ago_start=30)
+    _mk_store(root_d / "home" / "profiles" / "other", "abyss-data", minutes_ago_start=20)
+    r = _capture_status(
+        hermes_home=root_d / "home",
+        profile_home=root_d / "home" / "profiles" / "kraken")
+    check("capture: two fresh stores -> fragmented", r["status"] == "fragmented", r["summary"][:90])
+    check("capture: fragmented summary names offending stores",
+          "home-fallback" in r["summary"] and "profile:other" in r["summary"], r["summary"][:90])
+
+    # 5. REST contract through handle_request (real env paths — shape only)
+    r = handle_request("GET", "/doctor/capture")
+    check("capture: GET /doctor/capture returns verdict envelope",
+          isinstance(r, dict) and r.get("status") in ("ok", "fragmented", "outage", "no_data")
+          and isinstance(r.get("stores"), list) and "active_store" in r,
+          str(r.get("status")))
+    bad = handle_request("GET", "/doctor/capture", {"max_age_hours": "abc"})
+    check("capture: non-numeric max_age_hours -> 400",
+          isinstance(bad, dict) and bad.get("code") == 400, str(bad))
+    neg = handle_request("GET", "/doctor/capture", {"max_age_hours": "-1"})
+    check("capture: negative max_age_hours -> 400",
+          isinstance(neg, dict) and neg.get("code") == 400, str(neg))
+
+    # 6. /status carries the compact capture verdict for the statusbar chip
+    st = get_status()
+    check("status: includes capture summary block",
+          isinstance(st, dict) and (
+              st.get("capture") is None
+              or (isinstance(st.get("capture"), dict)
+                  and st["capture"].get("status")
+                  in ("ok", "fragmented", "outage", "no_data"))),
+          str((st.get("capture") or {}).get("status")))
+
     print()
     print(f"=== RESULT: {PASS} passed, {FAIL} failed ===")
 

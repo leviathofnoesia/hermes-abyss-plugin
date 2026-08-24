@@ -787,7 +787,46 @@ _AGENT_DEFAULT_TIMEOUT = int(os.environ.get("ABYSS_AGENT_TIMEOUT", "1200") or 12
 # (_cluster_incidents extracted to abyss_incidents.py)
 
 
-def _prune_data(days: int = 30) -> dict:
+def _vacuum_stores(min_freelist_pages: int = 64) -> dict:
+    """VACUUM both SQLite stores and report the disk space reclaimed.
+
+    DELETE only moves pages to the freelist — the files stay at their
+    high-water mark forever unless VACUUM runs (or auto_vacuum was enabled
+    before the DB was created, which it wasn't). After a big prune this is
+    what actually returns bytes to the OS. Freelist-empty VACUUMs are cheap
+    (live-page rewrite only), but a DB below ``min_freelist_pages`` free
+    pages has nothing to reclaim, so it is skipped entirely — this keeps
+    startup retention sweeps near-zero-cost when there is no bloat.
+    """
+    report = {}
+    freed_total = 0
+    for label, path in (("activity_db", ACTIVITY_DB), ("traces_db", TRACE_DB)):
+        try:
+            before = path.stat().st_size
+            conn = sqlite3.connect(str(path), timeout=30)
+            try:
+                with _lock:
+                    freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
+                    if freelist < min_freelist_pages:
+                        report[label] = {"skipped": "low_freelist",
+                                         "freelist_pages": freelist}
+                        continue
+                    conn.execute("VACUUM")
+            finally:
+                conn.close()
+            after = path.stat().st_size
+            freed = max(0, before - after)
+            freed_total += freed
+            report[label] = {"bytes_before": before, "bytes_after": after,
+                             "bytes_freed": freed, "freelist_pages": freelist}
+        except Exception as exc:
+            logger.debug("Abyss vacuum skipped for %s: %s", label, exc)
+            report[label] = {"error": str(exc)}
+    report["bytes_freed_total"] = freed_total
+    return report
+
+
+def _prune_data(days: int = 30, vacuum: bool = False) -> dict:
     """Delete activity/traces/signals/incidents + wave tables older than ``days``.
 
     Returns counts of deleted rows per table. ``days <= 0`` is a no-op.
@@ -796,6 +835,10 @@ def _prune_data(days: int = 30) -> dict:
     also carry timestamps and were NOT covered here — retention_days was
     silently no-op for them and they grew unbounded. They are pruned via
     abyss_wave.prune_wave_data (fail-open) and their counts merged.
+
+    ``vacuum=True`` additionally VACUUMs both stores after deleting so the
+    files actually shrink on disk (DELETE alone never returns pages to the
+    OS) and reports a ``vacuum`` block with per-DB byte deltas.
     """
     if days <= 0:
         base = {"activity": 0, "traces": 0, "signals": 0, "incidents": 0}
@@ -834,6 +877,8 @@ def _prune_data(days: int = 30) -> dict:
         counts.update(prune_wave_data(days))
     except Exception as exc:
         logger.debug("Abyss wave prune skipped: %s", exc)
+    if vacuum:
+        counts["vacuum"] = _vacuum_stores()
     return counts
 
 
@@ -1728,7 +1773,10 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
         elif path == "/prune" and method == "POST":
             data = _coerce_body(body)
             days = _int_param(data, "days", 30)
-            deleted = _prune_data(days)
+            # Explicit prune calls reclaim disk by default (DELETE alone
+            # never returns pages to the OS); opt out with {"vacuum": false}.
+            vacuum = bool(data.get("vacuum", True)) if isinstance(data, dict) else True
+            deleted = _prune_data(days, vacuum=vacuum)
             return {"deleted": deleted, "status": "ok"}
 
         elif path.startswith("/signals/") and path.endswith("/resolve-agent") and method == "POST":
@@ -2273,7 +2321,10 @@ def register(ctx) -> None:
             retention = int(SETTINGS.get("retention_days", 30) or 30)
         except Exception:
             retention = int(os.environ.get("ABYSS_RETENTION_DAYS", "30") or 30)
-        _prune_data(days=retention)
+        # vacuum=True is safe here: _vacuum_stores skips DBs below the
+        # freelist threshold, so this only rewrites files that retention
+        # pruning actually bloated.
+        _prune_data(days=retention, vacuum=True)
     except Exception as exc:
         logger.debug("Abyss startup maintenance skipped: %s", exc)
 
@@ -2640,8 +2691,12 @@ Category filters:
     if sub == "prune":
         """Delete data older than N days: /abyss prune [days]"""
         days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 30
-        deleted = _prune_data(days)
-        return f"✓ Pruned data older than {days} days: {deleted}"
+        deleted = _prune_data(days, vacuum=True)
+        vac = deleted.pop("vacuum", None)
+        msg = f"✓ Pruned data older than {days} days: {deleted}"
+        if vac and isinstance(vac, dict) and vac.get("bytes_freed_total"):
+            msg += f" — vacuum reclaimed {vac['bytes_freed_total']:,} bytes"
+        return msg
 
     if sub == "health":
         """Show overall agent health score."""

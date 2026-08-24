@@ -1202,6 +1202,101 @@ def _run_script():
                   in ("ok", "fragmented", "outage", "no_data"))),
           str((st.get("capture") or {}).get("status")))
 
+    # --- prune vacuum / disk reclaim -----------------------------------------
+    # Added 2026-08-24 (later shift): _prune_data DELETEs rows but SQLite keeps
+    # the file at its high-water mark forever — freelist pages are only
+    # returned to the OS by VACUUM. vacuum=True now reclaims the space and
+    # reports per-DB byte deltas.
+    print("\nSection: prune vacuum / disk reclaim")
+
+    reset_db()
+    conn = __init__._get_activity_conn()
+    blob = "x" * 512
+    for i in range(2000):
+        conn.execute(
+            "INSERT INTO activity (timestamp, action, metadata) VALUES (?, ?, ?)",
+            ("2000-01-01T00:00:00", "bulk-old", blob))
+    conn.commit()
+    conn.close()
+    tconn = __init__._get_trace_conn()
+    tconn.execute("INSERT INTO traces (session_id, event_type, timestamp) VALUES ('s', 'e', ?)",
+                  ("2000-01-01T00:00:00",))
+    tconn.commit()
+    tconn.close()
+
+    # Build freelist pressure directly so the shrink is observable even in a
+    # fresh temp DB: bulk-insert then hand-delete leaves free pages behind.
+    conn = __init__._get_activity_conn()
+    conn.execute("DELETE FROM activity WHERE action = 'bulk-old'")
+    conn.commit()
+    freelist_before = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    conn.close()
+
+    r = _prune_data(days=30)  # default: no vacuum
+    check("prune default does not vacuum",
+          "vacuum" not in r and r.get("activity") == 0 and r.get("traces") == 1,
+          str(sorted(r))[:90])
+
+    r = _prune_data(days=30, vacuum=True)
+    vac = r.get("vacuum")
+    check("prune vacuum=True returns vacuum block", isinstance(vac, dict), str(r)[:120])
+    check("vacuum block has per-db entries",
+          isinstance(vac, dict) and "activity_db" in vac and "traces_db" in vac
+          and isinstance(vac.get("bytes_freed_total"), int),
+          str(vac)[:120])
+
+    def _vac_entry_ok(e):
+        if not isinstance(e, dict):
+            return False
+        if "skipped" in e:
+            return e["skipped"] == "low_freelist" and isinstance(e.get("freelist_pages"), int)
+        return (e.get("bytes_freed", -1) >= 0 and e.get("bytes_after", 1) <= e.get("bytes_before", 0))
+
+    check("vacuum entries valid or low-freelist-skipped",
+          all(_vac_entry_ok(vac[k]) for k in ("activity_db", "traces_db")),
+          str(vac)[:140])
+    check("vacuum actually ran on bloated activity store",
+          "bytes_freed" in vac.get("activity_db", {}),
+          str(vac.get("activity_db"))[:100])
+
+    conn = __init__._get_activity_conn()
+    freelist_after = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    conn.close()
+    check("vacuum drains the freelist",
+          freelist_before > 0 and freelist_after <= freelist_before
+          and freelist_after < 100,
+          f"before={freelist_before} after={freelist_after}")
+
+    # REST contract: POST /prune defaults to vacuum; opt-out honored.
+    reset_db()
+    tconn = __init__._get_trace_conn()
+    tconn.execute("INSERT INTO traces (session_id, event_type, timestamp) VALUES ('s', 'e', ?)",
+                  ("2000-01-01T00:00:00",))
+    tconn.commit()
+    tconn.close()
+    resp = handle_request("POST", "/prune", {}, json.dumps({"days": 7}).encode("utf-8"))
+    check("POST /prune defaults vacuum on",
+          isinstance(resp, dict) and resp.get("status") == "ok"
+          and isinstance((resp.get("deleted") or {}).get("vacuum"), dict),
+          str(resp)[:120])
+    resp = handle_request("POST", "/prune", {}, json.dumps({"days": 7, "vacuum": False}).encode("utf-8"))
+    check("POST /prune vacuum=false skips vacuum",
+          isinstance(resp, dict) and resp.get("status") == "ok"
+          and "vacuum" not in (resp.get("deleted") or {}),
+          str(resp)[:120])
+
+    # slash surface mentions reclaim when bytes were freed
+    out = __init__._handle_slash("prune 365")
+    check("slash prune renders ok", out.startswith("✓ Pruned"), out[:100])
+
+    # low-freelist guard: huge threshold -> both stores skipped, no vacuum cost
+    vac_skip = __init__._vacuum_stores(min_freelist_pages=10**9)
+    check("vacuum skips below threshold",
+          all(vac_skip[k].get("skipped") == "low_freelist"
+              for k in ("activity_db", "traces_db"))
+          and vac_skip["bytes_freed_total"] == 0,
+          str(vac_skip)[:140])
+
     print()
     print(f"=== RESULT: {PASS} passed, {FAIL} failed ===")
 

@@ -834,6 +834,26 @@ function StatusStrip({ ctx, onNavigate }) {
     children: `· idle ${idle.text}`
   }) : null
 
+  // In-flight remediation disclosure (tick-44): /status aggregates how many
+  // cloud-agent fixes are running RIGHT NOW (signals + incidents with
+  // resolution_status='running' — the value the Watch tab's 8s poll also
+  // watches, but aggregated backend-side so a resolution on row 60 of a
+  // 50-row fetch still counts). The glance's verdict is "are my agents OK?";
+  // an active doctor/resolver is part of that answer — the operator must not
+  // have to open Watch to learn a fix is in flight, and on dark hooks
+  // ("idle 5h") a still-running resolution is the one sign of life left.
+  const resolvingCount = status?.resolutions_running ?? 0
+  const resolvingEl = resolvingCount > 0 ? jsx('span', {
+    // No compiled text-(--ui-blue) class exists in the host bundle (only
+    // red/yellow/green/accent do), so the tone is inline var(), matching the
+    // Calendar "running" glyph convention (DESIGN.md: inline styles for
+    // values with no compiled class).
+    className: 'shrink-0 abyss-tiny uppercase tracking-widest',
+    style: { color: 'var(--ui-blue)' },
+    title: `${resolvingCount} cloud-agent fix${resolvingCount === 1 ? '' : 'es'} in flight — resolving rows update every 8s`,
+    children: `· ${resolvingCount} resolving`
+  }) : null
+
   const healthScore = status?.score
   const healthTone = (status?.level === 'critical') ? 'text-(--ui-red)'
     : (status?.level === 'degraded' || status?.level === 'fair') ? 'text-(--ui-yellow)'
@@ -935,6 +955,7 @@ function StatusStrip({ ctx, onNavigate }) {
               }),
               criticals > 0 ? `${criticals} critical` : openSignals > 0 ? `${openSignals} open` : 'all clear',
               idleEl,
+              resolvingEl,
               '›'
             ]
           }) : jsxs('span', {
@@ -945,7 +966,8 @@ function StatusStrip({ ctx, onNavigate }) {
                 style: { backgroundColor: criticals > 0 ? 'var(--ui-red)' : openSignals > 0 ? 'var(--ui-yellow)' : 'var(--ui-green)' }
               }),
               criticals > 0 ? `${criticals} critical` : openSignals > 0 ? `${openSignals} open` : 'all clear',
-              idleEl
+              idleEl,
+              resolvingEl
             ]
           }),
           // Screen-reader parity for the glance: the strip's flash
@@ -959,7 +981,7 @@ function StatusStrip({ ctx, onNavigate }) {
             role: 'status',
             'aria-live': 'polite',
             className: 'sr-only',
-            children: `abyss health: ${criticals > 0 ? `${criticals} critical` : openSignals > 0 ? `${openSignals} open` : 'all clear'}${idle ? ` · idle ${idle.text}` : ''}`
+            children: `abyss health: ${criticals > 0 ? `${criticals} critical` : openSignals > 0 ? `${openSignals} open` : 'all clear'}${idle ? ` · idle ${idle.text}` : ''}${resolvingCount > 0 ? ` · ${resolvingCount} resolving` : ''}`
           })
         ]
       })
@@ -4158,6 +4180,11 @@ function AbyssStatusChip({ ctx }) {
   // parity with the pane's verdict idle disclosure).
   const idle = idleLabel(status?.last_activity_at)
   const idleCritical = idle && idle.tone === 'text-(--ui-red)'
+  // In-flight remediation disclosure (tick-45, StatusStrip tick-44 parity):
+  // the chip is the ONLY abyss surface visible while the dashboard is
+  // closed, so a running cloud-agent fix must be disclosed here too — a
+  // healthy-looking score with a resolver actively working is not "fine".
+  const resolvingCount = status?.resolutions_running ?? 0
   const tone = idleCritical ? 'text-(--ui-red)'
     : level === 'critical' ? 'text-(--ui-red)'
     : level === 'degraded' ? 'text-(--ui-yellow)'
@@ -4181,7 +4208,8 @@ function AbyssStatusChip({ ctx }) {
       jsx('span', { className: 'text-(--ui-text-secondary) abyss-mono', children: 'abyss' }),
       status && jsxs('span', {
         className: cn('flex items-center gap-1 abyss-mono tabular-nums', tone),
-        title: idle ? `last activity ${timeTitle(status.last_activity_at)} · idle ${idle.text}` : (`health ${score ?? '—'}` + (level ? ` · ${level}` : '')),
+        title: (idle ? `last activity ${timeTitle(status.last_activity_at)} · idle ${idle.text}` : (`health ${score ?? '—'}` + (level ? ` · ${level}` : '')))
+          + (resolvingCount > 0 ? ` · ${resolvingCount} cloud-agent fix${resolvingCount === 1 ? '' : 'es'} in flight` : ''),
         children: [
           jsx('span', {
             className: 'inline-block h-1.5 w-1.5 rounded-full',
@@ -4193,7 +4221,16 @@ function AbyssStatusChip({ ctx }) {
             },
             children: ''
           }),
-          score !== null && score !== undefined ? `${score}` : open
+          score !== null && score !== undefined ? `${score}` : open,
+          // Resolving marker: inline var(--ui-blue) — no compiled
+          // text-(--ui-blue) class exists in the host bundle (only
+          // red/yellow/green/accent do); matches the Calendar "running"
+          // glyph convention (DESIGN.md inline-style rule).
+          resolvingCount > 0 && jsx('span', {
+            className: 'inline-block h-1.5 w-1.5 rounded-full',
+            style: { backgroundColor: 'var(--ui-blue)' },
+            children: ''
+          })
         ]
       }),
       // Backend unreachable — never a silent blank or a false all-clear
@@ -5512,3 +5549,40 @@ export default {
 //   list/graph/timeline modes, TraceGraphView, TraceTimelineView, view-mode
 //   toggle, /trace routes all preserved (HealthView state/fetch/render
 //   only). No backend/Python touched.
+//
+// night-shift-tick-44 (this shift): in-flight remediation disclosure on the
+// glance. The backend aggregates `resolutions_running` in /status (signals +
+// incidents with resolution_status='running'), but the UI never surfaced it —
+// the Watch tab's per-row "resolving…" only samples the top-50 fetch, so a
+// fix running on row 60 was invisible, and the StatusStrip verdict ("are my
+// agents OK right now?") could not tell the operator a doctor/resolver was
+// actively working. On dark hooks ("idle 5h") a still-running resolution is
+// the one sign of life left. Now:
+//   1. New resolvingEl span after idleEl — '· N resolving', tone via inline
+//      var(--ui-blue) (no compiled text-(--ui-blue) class exists; only
+//      red/yellow/green/accent do — Calendar "running" glyph convention),
+//      hover title disclosing the count and the 8s Watch poll cadence.
+//   2. Wired into BOTH verdict branches (nav Button and plain span).
+//   3. StatusStrip sr-only echo extended so a screen-reader operator hears
+//      '· N resolving' (tick-27/39 a11y parity).
+//   Verified post-edit: node --input-type=module --check PASS + CJS check
+//   OK; check-hook-order clean (const + two render children + one aria
+//   string only, zero hooks touched); class tokens reused from the verified
+//   set; import surface unchanged. No backend/Python touched.
+//
+// night-shift-tick-45 (this shift): statusbar-chip remediation disclosure —
+// the always-visible surface closes the loop tick-44 opened on the pane's
+// StatusStrip. The chip is the ONLY abyss surface an operator sees while the
+// dashboard is closed, yet it stayed silent while a cloud-agent fix ran: a
+// healthy-looking score with a resolver actively working read as "fine" —
+// exactly the silent-state class ticks 42/44 target. Now:
+//   1. Blue companion dot next to the health dot when
+//      status.resolutions_running > 0 (inline var(--ui-blue), same
+//      no-compiled-class convention as tick-44).
+//   2. Chip tooltip extended with '· N cloud-agent fix(es) in flight' after
+//      the existing activity/health disclosure, so hover explains the blue
+//      dot without leaving the statusbar.
+//   Zero new imports, zero hooks (one const + one conditional child + one
+//   title concatenation). Verified post-edit: node --input-type=module
+//   --check PASS + CJS check OK; check-hook-order clean; braces/parens
+//   balanced. No backend/Python touched.

@@ -32,10 +32,16 @@ The only observability layer that watches Hermes agents from the inside: it hook
 ## Capabilities and Constraints
 
 Confirmed capabilities (from code):
-- Six views: Activity Feed, Calendar, Global Search, Tracing timeline, Hermes Brain graph, Signals & Incidents.
-- REST API: `/activity` (GET list/POST add), `/calendar`, `/search`, `/stats`, `/trace`, `/graph`, `/signals`, `/incidents`, `/signals/self-diagnostic`, `/incidents/cluster`, `/prune`, plus triage mutations: `/signals/{id}/acknowledge|resolve`, `/incidents/{id}/acknowledge|resolve|reopen|close`.
+- Eight views, defaulting to the Hermes Brain graph (the soul/centerpiece):
+  Brain · Watch (signals & incidents) · Health (doctor/benchmark) · Activity
+  Feed · Tracing timeline · Wave telemetry · Global Search · Calendar. Tab
+  order is brain / watch / health / activity / trace / wave / search / calendar.
+- Every symptom surface drills one click into the session trace (`trace ›` on
+  activity rows, signals, incidents, session search hits, brain session nodes,
+  and calendar chips with a session id).
+- REST API: `/activity` (GET list/POST add), `/calendar`, `/search`, `/stats`, `/status`, `/health`, `/trends`, `/failures`, `/trace`, `/graph`, `/signals`, `/incidents`, `/signals/self-diagnostic`, `/incidents/cluster`, `/prune`, `/doctor/run|approve|report|last`, `/benchmark/run`, `/wave/*`, plus triage mutations: `/signals/{id}/acknowledge|resolve`, `/incidents/{id}/acknowledge|resolve|reopen|close`, `/resolve-agent`.
 - Status bar chip (signal/llm count), sidebar nav, palette command, pane + full-page route.
-- Graph rendered on canvas (DitherKit force layout + Atkinson dithering background) with drag, hover, zoom.
+- Graph rendered on canvas (DitherKit force layout + Atkinson dithering background) with drag, hover, zoom, click/keyboard selection (arrows move, Enter opens a session trace), and a rAF-throttled resize recompute.
 - Slash commands: `/abyss recent|stats|search|trace|signals|incidents|diagnostic|clean`.
 
 Technical constraints (hard):
@@ -44,20 +50,20 @@ Technical constraints (hard):
 - Theme variables only for color; no `#hex`/`rgb()` literals.
 - Canvas panes need ResizeObserver; stale closures avoided via refs/state.
 - Must work at pane width (~420px) and full-page width.
-- Triage endpoints (acknowledge/resolve/reopen/close) exist in the API but the current UI does NOT wire them — an identified UX gap to close.
+- Triage endpoints (acknowledge/resolve/reopen/close) are wired in the UI with busy-state row buttons, plus agent-powered `/resolve-agent` dispatch and incident clustering; errors surface as recovery paths, never as silent no-ops.
 
 ## Brand Commitments
 
 - Name: "Abyss" — Raindrop-style observability. Existing i18n keys and plugin id `abyss` are stable. Codicon `eye` for nav/status.
-- Local-first privacy is a core trait: no external services.
+- Local-first: all observation (activity, signals, graph, traces) stays on-machine and is never exported. Agent-powered remediation (signal/incident `resolve (cloud agent)`, doctor approve) may dispatch a free-Nous cloud agent; every such action is labeled as cloud in the visible UI and the masthead boot line (`--cloud-fix`).
 - The DitherKit canvas graph is a signature feature; keep and elevate it, don't remove it.
 
 ## Evidence on Hand
 
-- Live plugin: `C:\Users\billy\AppData\Local\hermes\desktop-plugins\abyss\plugin.js` (1509 lines, incumbent UI).
+- Live plugin: `C:\Users\billy\AppData\Local\hermes\desktop-plugins\abyss\plugin.js` (single-file, phosphor-terminal design world per DESIGN.md).
 - Backend: `C:\Users\billy\AppData\Local\hermes\plugins\abyss\dashboard\plugin_api.py`, `__init__.py` (69 KB core), manifests.
 - Test harness: `test_plugin.py`, `dashboard/test_api.py` — expected PASS suite.
-- No screenshots or DESIGN.md exist; the incumbent visual identity is the generic Hermes SDK look (theme-variable Tailwind classes, no custom design system).
+- DESIGN.md is the committed design world (phosphor-terminal / midnight machine room); the incumbent generic-SDK look was replaced by it.
 
 ## Product Principles
 

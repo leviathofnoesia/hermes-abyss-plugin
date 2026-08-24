@@ -84,6 +84,36 @@ function palette() {
   }
 }
 
+// Theme-switch redraw (tick-53): both canvases (BrainGraph's phosphor renderer
+// and TraceGraphView's trajectory graph) resolve their colors from computed CSS
+// variables at DRAW time, but they only re-draw on data fetches (30s polls) or
+// resizes. Flip the host light/dark theme and the graphs keep the old theme's
+// palette baked into their bitmaps for up to half a minute — the one surface in
+// the plugin that visibly ignores a theme change. This observer watches the
+// attribute mutations the host app makes on <html> when the theme flips (class,
+// style, data-theme) and re-invokes the callback rAF-throttled so rapid flips
+// coalesce. Returns a disposer for effect cleanup. Guarded for exotic hosts
+// without MutationObserver.
+function observeTheme(onTheme) {
+  if (typeof document === 'undefined' || !document.documentElement ||
+      typeof MutationObserver === 'undefined' || typeof requestAnimationFrame === 'undefined') {
+    return () => { }
+  }
+  let raf = null
+  const mo = new MutationObserver(() => {
+    if (raf != null) return
+    raf = requestAnimationFrame(() => {
+      raf = null
+      try { onTheme() } catch (e) { console.error('[abyss] theme redraw failed', e) }
+    })
+  })
+  mo.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style', 'data-theme'] })
+  return () => {
+    mo.disconnect()
+    if (raf != null) cancelAnimationFrame(raf)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Date helpers
 // ---------------------------------------------------------------------------
@@ -1944,7 +1974,11 @@ function TraceGraphView({ ctx, session }) {
     draw()
     const ro = new ResizeObserver(draw)
     ro.observe(wrap)
-    return () => ro.disconnect()
+    // Theme-switch redraw (tick-53): palette() and themeColor() re-resolve on
+    // every draw, so re-invoking draw() adopts the flipped host theme without
+    // waiting for the next fetch/resize.
+    const untheme = observeTheme(draw)
+    return () => { ro.disconnect(); untheme() }
   }, [data, selected, session, canvasFocused])
 
   const onClick = (ev) => {
@@ -2612,6 +2646,17 @@ function BrainGraph({ ctx, onOpenTrace }) {
       if (rafId != null) cancelAnimationFrame(rafId)
       roRef.current?.disconnect()
     }
+  }, [])
+
+  // Theme-switch redraw (tick-53): _render() resolves colors live from computed
+  // CSS variables, so a plain re-render is enough to adopt the new palette.
+  // Mounted only when the canvas graph exists; the disposer tears down with
+  // the component. Hook declared unconditionally before any return (React #310).
+  useEffect(() => {
+    return observeTheme(() => {
+      const g = graphRef.current
+      if (g && g.canvas === canvasRef.current) g._render()
+    })
   }, [])
 
   const legend = [

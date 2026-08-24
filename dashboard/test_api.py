@@ -39,10 +39,13 @@ def check(name, cond, detail=""):
         print(f"  [FAIL] {name}{' — ' + detail if detail else ''}")
 
 
-print("=== FastAPI endpoint tests ===")
 
-# POST /activity — the path that used to silently drop bodies
-r = client.post("/api/plugins/abyss/activity", json={
+def _run_script():
+    global PASS, FAIL
+    print("=== FastAPI endpoint tests ===")
+
+    # POST /activity — the path that used to silently drop bodies
+    r = client.post("/api/plugins/abyss/activity", json={
     "action": "tool_call_completed",
     "description": "Called web_search via REST",
     "category": "tool",
@@ -50,117 +53,139 @@ r = client.post("/api/plugins/abyss/activity", json={
     "session_id": "api-sess",
     "tool_name": "web_search",
     "args": {"query": "raindrop"},
-})
-check("POST /activity accepts body", r.status_code == 200 and r.json().get("id") is not None, str(r.json()))
+    })
+    check("POST /activity accepts body", r.status_code == 200 and r.json().get("id") is not None, str(r.json()))
 
-# GET /activity
-r = client.get("/api/plugins/abyss/activity", params={"limit": 5})
-check("GET /activity", r.status_code == 200 and len(r.json()) == 1)
+    # GET /activity
+    r = client.get("/api/plugins/abyss/activity", params={"limit": 5})
+    check("GET /activity", r.status_code == 200 and len(r.json()) == 1)
 
-# POST /activity with empty body must not crash
-r = client.post("/api/plugins/abyss/activity", json={})
-check("POST /activity empty body tolerated", r.status_code == 200, str(r.json()))
+    # GET /activity with session_id filter (drill one session's activity story)
+    r = client.get("/api/plugins/abyss/activity", params={"session_id": "api-sess"})
+    check("GET /activity session filter", r.status_code == 200 and len(r.json()) == 1)
+    r = client.get("/api/plugins/abyss/activity", params={"session_id": "no-such-session"})
+    check("GET /activity session filter empty", r.status_code == 200 and len(r.json()) == 0)
 
-# GET /stats
-r = client.get("/api/plugins/abyss/stats")
-data = r.json()
-check("GET /stats", r.status_code == 200 and data.get("total_activities", 0) >= 1)
-check("GET /stats health fields", "error_rate" in data and "signals_open" in data and "top_tools" in data)
+    # POST /activity with empty body must not crash
+    r = client.post("/api/plugins/abyss/activity", json={})
+    check("POST /activity empty body tolerated", r.status_code == 200, str(r.json()))
 
-# GET /search
-r = client.get("/api/plugins/abyss/search", params={"q": "web_search"})
-check("GET /search", r.status_code == 200 and len(r.json()) >= 1)
+    # GET /stats
+    r = client.get("/api/plugins/abyss/stats")
+    data = r.json()
+    check("GET /stats", r.status_code == 200 and data.get("total_activities", 0) >= 1)
+    check("GET /stats health fields", "error_rate" in data and "signals_open" in data and "top_tools" in data)
 
-# GET /calendar
-r = client.get("/api/plugins/abyss/calendar")
-check("GET /calendar", r.status_code == 200 and isinstance(r.json(), list))
+    # GET /search
+    r = client.get("/api/plugins/abyss/search", params={"q": "web_search"})
+    check("GET /search", r.status_code == 200 and len(r.json()) >= 1)
 
-# GET /trace without session -> recent sessions
-r = client.get("/api/plugins/abyss/trace", params={"limit": 5})
-check("GET /trace (sessions)", r.status_code == 200 and isinstance(r.json(), list))
+    # GET /calendar
+    r = client.get("/api/plugins/abyss/calendar")
+    cal_data = r.json()
+    check("GET /calendar", r.status_code == 200 and isinstance(cal_data, list))
+    cal_rest = next((c for c in cal_data if c.get("session_id")), None)
+    check("GET /calendar rows carry session_id (trace drill)",
+          bool(cal_rest) and cal_rest["session_id"] == "api-sess", str(cal_rest))
+    check("GET /calendar rows carry tool_name",
+          bool(cal_rest) and cal_rest.get("tool_name") == "web_search", str(cal_rest))
 
-# GET /trace with session
-r = client.get("/api/plugins/abyss/trace", params={"session_id": "api-sess"})
-check("GET /trace (session)", r.status_code == 200 and isinstance(r.json(), list))
+    # GET /trace without session -> recent sessions
+    r = client.get("/api/plugins/abyss/trace", params={"limit": 5})
+    check("GET /trace (sessions)", r.status_code == 200 and isinstance(r.json(), list))
 
-# GET /graph
-r = client.get("/api/plugins/abyss/graph", params={"limit": 50})
-g = r.json()
-check("GET /graph", r.status_code == 200 and "nodes" in g and "edges" in g)
+    # GET /trace with session
+    r = client.get("/api/plugins/abyss/trace", params={"session_id": "api-sess"})
+    check("GET /trace (session)", r.status_code == 200 and isinstance(r.json(), list))
 
-# POST self-diagnostic
-r = client.post("/api/plugins/abyss/signals/self-diagnostic", json={
+    # GET /graph
+    r = client.get("/api/plugins/abyss/graph", params={"limit": 50})
+    g = r.json()
+    check("GET /graph", r.status_code == 200 and "nodes" in g and "edges" in g)
+
+    # POST self-diagnostic
+    r = client.post("/api/plugins/abyss/signals/self-diagnostic", json={
     "session_id": "api-sess", "capability": "web_search", "gap": "429 rate limit",
-})
-check("POST self-diagnostic", r.status_code == 200 and r.json().get("status") == "recorded")
+    })
+    check("POST self-diagnostic", r.status_code == 200 and r.json().get("status") == "recorded")
 
-# GET /signals
-r = client.get("/api/plugins/abyss/signals")
-sigs = r.json()
-check("GET /signals", r.status_code == 200 and len(sigs) >= 1)
-check("signals have details column", any("details" in s for s in sigs))
+    # GET /signals
+    r = client.get("/api/plugins/abyss/signals")
+    sigs = r.json()
+    check("GET /signals", r.status_code == 200 and len(sigs) >= 1)
+    check("signals have details column", any("details" in s for s in sigs))
 
-# POST /incidents/cluster
-r = client.post("/api/plugins/abyss/incidents/cluster")
-check("POST /incidents/cluster", r.status_code == 200 and "incidents_created" in r.json())
+    # POST /signals/resolve-bulk (triage-safe cleanup)
+    r = client.post("/api/plugins/abyss/signals/resolve-bulk", json={"signal_type": "rate_limit"})
+    check("POST /signals/resolve-bulk", r.status_code == 200 and "resolved" in r.json() and "signal_ids" in r.json(), str(r.json()))
+    r = client.post("/api/plugins/abyss/signals/resolve-bulk", json={})
+    check("POST /signals/resolve-bulk requires filter", r.json().get("code") == 400, str(r.json()))
+    # GET /signals
 
-# GET /incidents
-r = client.get("/api/plugins/abyss/incidents")
-check("GET /incidents", r.status_code == 200 and isinstance(r.json(), list))
+    # POST /incidents/cluster
+    r = client.post("/api/plugins/abyss/incidents/cluster")
+    check("POST /incidents/cluster", r.status_code == 200 and "incidents_created" in r.json())
 
-# Triage endpoints (use real ids from the DB)
-sig_id = sigs[0]["id"]
-r = client.post(f"/api/plugins/abyss/signals/{sig_id}/acknowledge")
-check("POST signal acknowledge", r.status_code == 200 and r.json().get("status") == "acknowledged")
-r = client.post(f"/api/plugins/abyss/signals/{sig_id}/resolve")
-check("POST signal resolve", r.status_code == 200 and r.json().get("status") == "resolved")
-r = client.post("/api/plugins/abyss/signals/999999/acknowledge")
-check("POST signal ack 404", r.status_code == 200 and r.json().get("code") == 404)
+    # GET /incidents
+    r = client.get("/api/plugins/abyss/incidents")
+    check("GET /incidents", r.status_code == 200 and isinstance(r.json(), list))
 
-incs = client.get("/api/plugins/abyss/incidents").json()
-if incs:
-    inc_id = incs[0]["id"]
-    r = client.post(f"/api/plugins/abyss/incidents/{inc_id}/acknowledge")
-    check("POST incident acknowledge", r.status_code == 200 and r.json().get("status") == "acknowledged")
-    r = client.post(f"/api/plugins/abyss/incidents/{inc_id}/resolve")
-    check("POST incident resolve", r.status_code == 200 and r.json().get("status") == "resolved")
-    r = client.post(f"/api/plugins/abyss/incidents/{inc_id}/reopen")
-    check("POST incident reopen", r.status_code == 200 and r.json().get("status") == "open")
-else:
-    print("  [SKIP] incident triage (no incidents seeded)")
+    # Triage endpoints (use real ids from the DB)
+    sig_id = sigs[0]["id"]
+    r = client.post(f"/api/plugins/abyss/signals/{sig_id}/acknowledge")
+    check("POST signal acknowledge", r.status_code == 200 and r.json().get("status") == "acknowledged")
+    r = client.post(f"/api/plugins/abyss/signals/{sig_id}/resolve")
+    check("POST signal resolve", r.status_code == 200 and r.json().get("status") == "resolved")
+    r = client.post("/api/plugins/abyss/signals/999999/acknowledge")
+    check("POST signal ack 404", r.status_code == 200 and r.json().get("code") == 404)
 
-# POST /prune
-r = client.post("/api/plugins/abyss/prune", json={"days": 365})
-check("POST /prune", r.status_code == 200 and r.json().get("status") == "ok" and "deleted" in r.json())
+    incs = client.get("/api/plugins/abyss/incidents").json()
+    if incs:
+        inc_id = incs[0]["id"]
+        r = client.post(f"/api/plugins/abyss/incidents/{inc_id}/acknowledge")
+        check("POST incident acknowledge", r.status_code == 200 and r.json().get("status") == "acknowledged")
+        r = client.post(f"/api/plugins/abyss/incidents/{inc_id}/resolve")
+        check("POST incident resolve", r.status_code == 200 and r.json().get("status") == "resolved")
+        r = client.post(f"/api/plugins/abyss/incidents/{inc_id}/reopen")
+        check("POST incident reopen", r.status_code == 200 and r.json().get("status") == "open")
+    else:
+        print("  [SKIP] incident triage (no incidents seeded)")
 
-# New analytics endpoints
-r = client.get("/api/plugins/abyss/health")
-d = r.json()
-check("GET /health", r.status_code == 200 and 0 <= d.get("score", -1) <= 100 and "components" in d)
-r = client.get("/api/plugins/abyss/trends", params={"days": 1, "bucket": "hour"})
-check("GET /trends", r.status_code == 200 and "timestamps" in r.json() and "activity" in r.json())
-r = client.get("/api/plugins/abyss/trends", params={"bucket": "day"})
-check("GET /trends default days", r.status_code == 200 and r.json().get("days") == 7)
-r = client.get("/api/plugins/abyss/failures", params={"limit": 5})
-check("GET /failures", r.status_code == 200 and {"by_type", "by_tool", "by_message"} <= set(r.json().keys()))
-r = client.get("/api/plugins/abyss/export")
-e = r.json()
-check("GET /export", r.status_code == 200 and {"activity", "signals", "incidents", "traces"} <= set(e.keys()))
-r = client.get("/api/plugins/abyss/status")
-s = r.json()
-check("GET /status", r.status_code == 200 and {"score", "level", "signals_open", "incidents_open"} <= set(s.keys()))
+    # POST /prune
+    r = client.post("/api/plugins/abyss/prune", json={"days": 365})
+    check("POST /prune", r.status_code == 200 and r.json().get("status") == "ok" and "deleted" in r.json())
 
-# Unknown endpoint -> FastAPI-level 404 (router has no such route)
-r = client.get("/api/plugins/abyss/nope")
-check("unknown endpoint 404", r.status_code == 404, f"status {r.status_code}")
+    # New analytics endpoints
+    r = client.get("/api/plugins/abyss/health")
+    d = r.json()
+    check("GET /health", r.status_code == 200 and 0 <= d.get("score", -1) <= 100 and "components" in d)
+    r = client.get("/api/plugins/abyss/trends", params={"days": 1, "bucket": "hour"})
+    check("GET /trends", r.status_code == 200 and "timestamps" in r.json() and "activity" in r.json())
+    r = client.get("/api/plugins/abyss/trends", params={"bucket": "day"})
+    check("GET /trends default days", r.status_code == 200 and r.json().get("days") == 7)
+    r = client.get("/api/plugins/abyss/failures", params={"limit": 5})
+    check("GET /failures", r.status_code == 200 and {"by_type", "by_tool", "by_message"} <= set(r.json().keys()))
+    r = client.get("/api/plugins/abyss/performance")
+    p = r.json()
+    check("GET /performance", r.status_code == 200 and {"totals", "tools", "models"} <= set(p.keys()))
+    check("GET /performance totals shape", "tool_calls" in p.get("totals", {}) and "llm_requests" in p.get("totals", {}))
+    r = client.get("/api/plugins/abyss/export")
+    e = r.json()
+    check("GET /export", r.status_code == 200 and {"activity", "signals", "incidents", "traces"} <= set(e.keys()))
+    r = client.get("/api/plugins/abyss/status")
+    s = r.json()
+    check("GET /status", r.status_code == 200 and {"score", "level", "signals_open", "incidents_open"} <= set(s.keys()))
 
-print("=== Agent resolution + doctor endpoints (stub agent) ===")
-import json as _json
-import time as _time
+    # Unknown endpoint -> FastAPI-level 404 (router has no such route)
+    r = client.get("/api/plugins/abyss/nope")
+    check("unknown endpoint 404", r.status_code == 404, f"status {r.status_code}")
 
-_stub = Path(_TMP) / "stub_agent_api.py"
-_stub.write_text('''
-import json, os
+    print("=== Agent resolution + doctor endpoints (stub agent) ===")
+    import json as _json
+    import time as _time
+
+    _stub = Path(_TMP) / "stub_agent_api.py"
+    _stub.write_text('''import json, os
 rp = os.environ.get("ABYSS_REPORT_PATH", "")
 role = os.environ.get("ABYSS_AGENT_ROLE", "resolver")
 report = {
@@ -181,64 +206,84 @@ if rp:
         json.dump(report, f)
 print(report["summary"])
 ''', encoding="utf-8")
-os.environ["ABYSS_AGENT_CMD"] = _json.dumps([sys.executable, str(_stub)])
-os.environ["ABYSS_AGENT_TIMEOUT"] = "30"
-os.environ["ABYSS_STUB_STATUS"] = "succeeded"
-os.environ["ABYSS_STUB_SUMMARY"] = "stub fixed the issue"
-os.environ["ABYSS_STUB_PROPOSED"] = "[]"
-os.environ["ABYSS_STUB_FIXES"] = "[]"
+    os.environ["ABYSS_AGENT_CMD"] = _json.dumps([sys.executable, str(_stub)])
+    os.environ["ABYSS_AGENT_TIMEOUT"] = "30"
+    os.environ["ABYSS_STUB_STATUS"] = "succeeded"
+    os.environ["ABYSS_STUB_SUMMARY"] = "stub fixed the issue"
+    os.environ["ABYSS_STUB_PROPOSED"] = "[]"
+    os.environ["ABYSS_STUB_FIXES"] = "[]"
 
 
-def _wait_for_api(pred, timeout=15):
-    deadline = _time.time() + timeout
-    while _time.time() < deadline:
-        if pred():
-            return True
-        _time.sleep(0.2)
-    return False
+    def _wait_for_api(pred, timeout=15):
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            if pred():
+                return True
+            _time.sleep(0.2)
+        return False
 
 
-# Fresh signal for the resolver agent
-r = client.post("/api/plugins/abyss/signals/self-diagnostic", json={
+    # Fresh signal for the resolver agent
+    r = client.post("/api/plugins/abyss/signals/self-diagnostic", json={
     "session_id": "api-res", "capability": "web_search", "gap": "429 rate limit",
-})
-sigs = client.get("/api/plugins/abyss/signals").json()
-sig_id = sigs[0]["id"]
-r = client.post(f"/api/plugins/abyss/signals/{sig_id}/resolve-agent")
-check("POST signal resolve-agent", r.status_code == 200 and r.json().get("status") == "dispatched", str(r.json()))
-ok = _wait_for_api(lambda: client.get("/api/plugins/abyss/signals").json()[0].get("resolution_status") == "succeeded")
-check("signal resolved by agent via REST", ok)
-row = client.get("/api/plugins/abyss/signals").json()[0]
-check("REST row carries note + resolved", row.get("resolved") == 1 and row.get("resolution_note") == "stub fixed the issue")
+    })
+    sigs = client.get("/api/plugins/abyss/signals").json()
+    sig_id = sigs[0]["id"]
+    r = client.post(f"/api/plugins/abyss/signals/{sig_id}/resolve-agent")
+    check("POST signal resolve-agent", r.status_code == 200 and r.json().get("status") == "dispatched", str(r.json()))
+    ok = _wait_for_api(lambda: client.get("/api/plugins/abyss/signals").json()[0].get("resolution_status") == "succeeded")
+    check("signal resolved by agent via REST", ok)
+    row = client.get("/api/plugins/abyss/signals").json()[0]
+    check("REST row carries note + resolved", row.get("resolved") == 1 and row.get("resolution_note") == "stub fixed the issue")
 
-# Fresh signal for the doctor flow
-r = client.post("/api/plugins/abyss/signals/self-diagnostic", json={
+    # Fresh signal for the doctor flow
+    r = client.post("/api/plugins/abyss/signals/self-diagnostic", json={
     "session_id": "api-doc", "capability": "web_search", "gap": "timeout",
-})
-sigs = client.get("/api/plugins/abyss/signals").json()
-doc_sig_id = sigs[0]["id"]
-os.environ["ABYSS_STUB_SUMMARY"] = "diagnosis complete"
-os.environ["ABYSS_STUB_PROPOSED"] = _json.dumps([
+    })
+    sigs = client.get("/api/plugins/abyss/signals").json()
+    doc_sig_id = sigs[0]["id"]
+    os.environ["ABYSS_STUB_SUMMARY"] = "diagnosis complete"
+    os.environ["ABYSS_STUB_PROPOSED"] = _json.dumps([
     {"id": "fix-1", "title": "fix timeout", "action": "raise timeout", "target_signals": [doc_sig_id], "target_incidents": []}
-])
-r = client.post("/api/plugins/abyss/doctor/run")
-check("POST /doctor/run", r.status_code == 200 and r.json().get("status") == "dispatched", str(r.json()))
-rid = r.json()["report_id"]
-ok = _wait_for_api(lambda: client.get("/api/plugins/abyss/doctor/report", params={"report_id": rid}).json().get("status") == "ready")
-check("GET /doctor/report ready", ok)
-rep = client.get("/api/plugins/abyss/doctor/report", params={"report_id": rid}).json()
-check("doctor report proposes fix for target", rep["report"]["proposed_fixes"][0]["target_signals"] == [doc_sig_id], str(rep)[:200])
-os.environ["ABYSS_STUB_FIXES"] = _json.dumps([
+    ])
+    r = client.post("/api/plugins/abyss/doctor/run")
+    check("POST /doctor/run", r.status_code == 200 and r.json().get("status") == "dispatched", str(r.json()))
+    rid = r.json()["report_id"]
+    ok = _wait_for_api(lambda: client.get("/api/plugins/abyss/doctor/report", params={"report_id": rid}).json().get("status") == "ready")
+    check("GET /doctor/report ready", ok)
+    rep = client.get("/api/plugins/abyss/doctor/report", params={"report_id": rid}).json()
+    check("doctor report proposes fix for target", rep["report"]["proposed_fixes"][0]["target_signals"] == [doc_sig_id], str(rep)[:200])
+    os.environ["ABYSS_STUB_FIXES"] = _json.dumps([
     {"id": "fix-1", "status": "applied", "note": "raised timeout", "target_signals": [doc_sig_id], "target_incidents": []}
-])
-os.environ["ABYSS_STUB_SUMMARY"] = "applied the fix"
-r = client.post("/api/plugins/abyss/doctor/approve", json={"report_id": rid})
-check("POST /doctor/approve", r.status_code == 200 and r.json().get("status") == "dispatched", str(r.json()))
-ok = _wait_for_api(lambda: client.get("/api/plugins/abyss/signals").json()[0].get("resolution_status") == "succeeded")
-check("approved fix applied via REST", ok)
+    ])
+    os.environ["ABYSS_STUB_SUMMARY"] = "applied the fix"
+    r = client.post("/api/plugins/abyss/doctor/approve", json={"report_id": rid})
+    check("POST /doctor/approve", r.status_code == 200 and r.json().get("status") == "dispatched", str(r.json()))
+    ok = _wait_for_api(lambda: client.get("/api/plugins/abyss/signals").json()[0].get("resolution_status") == "succeeded")
+    check("approved fix applied via REST", ok)
 
-print()
-print(f"=== RESULT: {PASS} passed, {FAIL} failed ===")
-if FAIL:
-    sys.exit(1)
-print("All Abyss API tests passed!")
+    print()
+    print(f"=== RESULT: {PASS} passed, {FAIL} failed ===")
+    if FAIL:
+        sys.exit(1)
+    print("All Abyss API tests passed!")
+
+
+def test_runner():
+    global PASS, FAIL
+    PASS = 0
+    FAIL = 0
+    import sys as _sys
+    try:
+        _run_script()
+    except SystemExit as e:
+        if e.code != 0:
+            raise AssertionError(f"test_runner: non-zero exit {e.code}") from e
+    if FAIL:
+        raise AssertionError(f"test_runner: FAIL={FAIL}")
+
+
+if __name__ == "__main__":
+    _run_script()
+    if FAIL:
+        raise AssertionError(f"test_runner: FAIL={FAIL}")

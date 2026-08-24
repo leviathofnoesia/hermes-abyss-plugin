@@ -43,6 +43,10 @@ config_schema:
     type: boolean
     default: true
     description: "Emit an empty_stream signal when a streamed response yields zero tokens."
+  stream_signal_coalesce_minutes:
+    type: integer
+    default: 10
+    description: "Coalesce repeated same-type wave signals (e.g. empty_stream) per session within N minutes into one signal with a repeat_count detail, instead of inserting one row per occurrence."
 # Doctor-clean declaration (#64230): the Plugin Doctor compares registered
 # hooks against provides_hooks, so every hook we register must be listed.
 provides_hooks:
@@ -69,7 +73,7 @@ provides_hooks:
   - on_skill_lifecycle
 commands:
   - name: abyss
-    description: "Abyss observability: /abyss stats|health|trends|failures|recent|search|trace|signals|incidents|ack|resolve|diagnostic|webhook|prune|wave"
+    description: "Abyss observability: /abyss stats|health|trends|failures|performance|recent|search|trace|signals|incidents|ack|resolve|resolve-stale|diagnostic|webhook|prune|wave"
   - name: abyss.recent
     description: "Show recent activity feed"
     alias: "/activity"

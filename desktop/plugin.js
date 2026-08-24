@@ -4082,8 +4082,45 @@ function WaveView({ ctx }) {
   })
 }
 
+// Tab persistence (tick-50): the dashboard renders in TWO mounts — the
+// right-sidebar pane and the full-page /abyss route — each with fresh
+// state, so every pane↔page move or close/reopen bounced the operator
+// back to 'brain' mid-investigation. The last tab now survives mounts in
+// sessionStorage (per-window, so pane and page agree). All storage access
+// is guarded: a blob-origin document can have storage disabled, in which
+// case this degrades to exactly the old behavior.
+const ABYSS_TAB_KEY = 'abyss.activeTab'
+// Operational instruments first: the Brain graph opens by default (the
+// centerpiece), then triage (watch) and health — the symptom surfaces —
+// then the browsing/telemetry views.
+const ABYSS_TABS = [
+  { value: 'brain', label: 'brain' },
+  { value: 'signals', label: 'watch' },
+  { value: 'health', label: 'health' },
+  { value: 'activity', label: 'activity' },
+  { value: 'tracing', label: 'trace' },
+  { value: 'wave', label: 'wave' },
+  { value: 'search', label: 'search' },
+  { value: 'calendar', label: 'calendar' }
+]
+function loadSavedTab() {
+  try {
+    const saved = sessionStorage.getItem(ABYSS_TAB_KEY)
+    // Validate against the live tab list: a stale key from an older build
+    // must never select a tab that no longer exists.
+    if (saved && ABYSS_TABS.some(t => t.value === saved)) return saved
+  } catch { /* storage unavailable — default below */ }
+  return 'brain'
+}
+
 function AbyssDashboard({ ctx }) {
-  const [activeTab, setActiveTab] = useState('brain')
+  const [activeTab, setActiveTab] = useState(() => loadSavedTab())
+  // Every tab change funnels through here (manual click, StatusStrip drill,
+  // trace jump) so the choice is persisted before any remount can lose it.
+  const selectTab = useCallback((value) => {
+    setActiveTab(value)
+    try { sessionStorage.setItem(ABYSS_TAB_KEY, String(value)) } catch { }
+  }, [])
   // Drill-down: every symptom surface (activity rows, signals, incidents,
   // session search hits, brain session nodes, calendar chips) funnels into
   // the same session-trace jump.
@@ -4091,8 +4128,8 @@ function AbyssDashboard({ ctx }) {
   const openTrace = useCallback((sid) => {
     if (!sid) return
     setTracePreset(sid)
-    setActiveTab('tracing')
-  }, [])
+    selectTab('tracing')
+  }, [selectTab])
 
   // The drill preset is a ONE-SHOT: TracingView applies it once and reports
   // back through onPresetConsumed, at which point the dashboard forgets it.
@@ -4118,33 +4155,22 @@ function AbyssDashboard({ ctx }) {
     }
   }, [ctx])
 
-  // Operational instruments first: the Brain graph opens by default (the
-  // centerpiece), then triage (watch) and health — the symptom surfaces —
-  // then the browsing/telemetry views.
-  const tabs = [
-    { value: 'brain', label: 'brain' },
-    { value: 'signals', label: 'watch' },
-    { value: 'health', label: 'health' },
-    { value: 'activity', label: 'activity' },
-    { value: 'tracing', label: 'trace' },
-    { value: 'wave', label: 'wave' },
-    { value: 'search', label: 'search' },
-    { value: 'calendar', label: 'calendar' }
-  ]
+  // Tab list lives at module scope (ABYSS_TABS) so loadSavedTab() can
+  // validate the persisted value against it before any mount renders.
 
   return jsxs('div', {
     className: 'flex h-full flex-col bg-background text-foreground',
     children: [
       jsx(Masthead, {}),
-      jsx(StatusStrip, { ctx, onNavigate: setActiveTab }),
+      jsx(StatusStrip, { ctx, onNavigate: selectTab }),
       jsxs(Tabs, {
         value: activeTab,
-        onValueChange: setActiveTab,
+        onValueChange: selectTab,
         className: 'flex-1 min-h-0',
         children: [
           jsx(TabsList, {
             className: 'flex w-full items-center justify-start overflow-x-auto shrink-0 bg-(--ui-bg-quaternary) border-b border-(--ui-stroke-tertiary)',
-            children: tabs.map(tab =>
+            children: ABYSS_TABS.map(tab =>
               jsx(TabsTrigger, {
                 key: tab.value,
                 value: tab.value,
@@ -5701,3 +5727,25 @@ export default {
 // Verified post-edit: node --input-type=module --check PASS + CJS check OK;
 // string-aware brace/paren balance clean; hook order / import surface
 // untouched. No backend/Python touched.
+//
+// night-shift-tick-50 (this shift): dashboard tab persistence across
+// mounts — the dashboard renders in TWO mounts (right-sidebar pane and the
+// full-page /abyss route), each with fresh state, so every pane<->page move
+// or close/reopen bounced the operator back to 'brain' mid-investigation.
+// The last active tab now survives mounts:
+//   1. Module-scope ABYSS_TABS (ordering doctrine comment moved with it) +
+//      loadSavedTab() which validates the persisted value against the live
+//      tab list, so a stale key from an older build can never select a tab
+//      that no longer exists.
+//   2. useState lazy-init from loadSavedTab(); a new selectTab() callback
+//      funnels EVERY tab change (manual click via onValueChange,
+//      StatusStrip tile drills via onNavigate, trace jumps via openTrace)
+//      through setActiveTab + a guarded sessionStorage write.
+//   3. All storage access is try/catch-guarded: a blob-origin document can
+//      have storage disabled, in which case behavior degrades to exactly
+//      the old always-'brain' default. Per-window storage means pane and
+//      page agree on the last tab.
+// Zero new imports (useState/useCallback already in scope), zero hooks or
+// fetch paths touched, zero class tokens added. Verified post-edit: node
+// --input-type=module --check PASS + CJS check OK; string-aware brace/paren
+// balance clean; no backend/Python touched.

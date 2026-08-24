@@ -314,6 +314,69 @@ def _run_script():
         check("stuck_stream carries session", hang_sig[0]["session_id"] == "hang-sess")
     check("fresh stream still accumulates", ("ok-sess", "ok-turn") in wave._STREAMS)
 
+    print("=== Stuck sweep keys on SILENCE, not age (long-stream regression) ===")
+    # Regression (2026-08-24): a legitimate generation that has been streaming
+    # for > _STREAM_STUCK_AFTER (big analysis turn, long doc generation) keeps
+    # receiving on_stream_delta. The old age-only check (`now - started`)
+    # swept it as "stuck" the next time ANY new stream started — false
+    # stuck_stream warning, bogus finished=0 row, duplicate late-end row.
+    # Liveness is now tracked per-accumulator via `last_seen`; an old stream
+    # with recent deltas must survive the sweep, a genuinely silent one must
+    # still be caught.
+    wave._STREAMS.clear()
+    wave._STREAMS[("active-sess", "active-turn")] = {
+        "started": time.time() - wave._STREAM_STUCK_AFTER - 120,  # old
+        "last_seen": time.time() - 3,                             # but live
+        "chars": 5000,
+        "deltas": 200,
+        "kinds": {"text": 200},
+        "iteration": 0,
+        "model": "m-active",
+        "provider": "p-active",
+        "surface": "cli",
+        "session_id": "active-sess",
+        "turn_id": "active-turn",
+        "first_token_ms": 900,
+    }
+    _on_stream_start(turn_id="trigger-turn", session_id="trigger-sess", model="m", provider="p", surface="cli")
+    check("actively-streaming old stream NOT swept as stuck",
+          ("active-sess", "active-turn") in wave._STREAMS,
+          f"keys={list(wave._STREAMS.keys())}")
+    active_rows = conn_rows("SELECT * FROM streams WHERE turn_id='active-turn'")
+    check("active stream not persisted as stuck", len(active_rows) == 0,
+          json.dumps(active_rows[0])[:160] if active_rows else "none")
+    active_sig = conn_rows("SELECT * FROM signals WHERE signal_type='stuck_stream' AND session_id='active-sess'")
+    check("no stuck_stream signal for active stream", len(active_sig) == 0,
+          str(active_sig))
+    # A stream SILENT for the threshold is still swept (core path unchanged);
+    # its row now surfaces how long it was idle and how many deltas arrived.
+    wave._STREAMS.clear()
+    wave._STREAMS[("silent-sess", "silent-turn")] = {
+        "started": time.time() - wave._STREAM_STUCK_AFTER - 60,
+        "last_seen": time.time() - wave._STREAM_STUCK_AFTER - 60,
+        "chars": 3,
+        "deltas": 1,
+        "kinds": {"text": 1},
+        "iteration": 0,
+        "model": "m-silent",
+        "provider": "p-silent",
+        "surface": "cli",
+        "session_id": "silent-sess",
+        "turn_id": "silent-turn",
+        "first_token_ms": 700,
+    }
+    _on_stream_start(turn_id="trigger-turn2", session_id="trigger-sess2", model="m", provider="p", surface="cli")
+    check("silent old stream still swept", ("silent-sess", "silent-turn") not in wave._STREAMS,
+          f"keys={list(wave._STREAMS.keys())}")
+    silent_rows = conn_rows("SELECT * FROM streams WHERE turn_id='silent-turn'")
+    check("silent stream persisted as finished=0", len(silent_rows) == 1 and silent_rows[0]["finished"] == 0,
+          json.dumps(silent_rows[0])[:160] if silent_rows else "none")
+    if silent_rows:
+        check("stuck row notes idle time + deltas",
+              "idle" in (silent_rows[0].get("error") or "") and "1 delta" in (silent_rows[0].get("error") or ""),
+              str(silent_rows[0].get("error"))[:120])
+    wave._STREAMS.clear()
+
     print("=== _session_activity_count timezone-aware 24h window ===")
     # Regression: the 24h cutoff must be computed in LOCAL time to match
     # how activity timestamps are stored (datetime.now().isoformat()).

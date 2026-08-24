@@ -713,20 +713,29 @@ def _on_session_finalize(
 
 
 def _sweep_stuck_streams() -> int:
-    """Persist + signal streams that started but never received on_stream_end.
+    """Persist + signal streams that went silent and never received on_stream_end.
 
     A stream that opened an accumulator but never delivered an on_stream_end
     (provider hang, dropped hook, killed process) used to be silently evicted
     at the _STREAM_MAX cap — no durable row, no signal. Now, whenever a new
-    stream starts, we sweep accumulators older than _STREAM_STUCK_AFTER and
-    record them as finished=0 streams rows plus a `stuck_stream` warning
-    signal so the silent failure is observable.
+    stream starts, we sweep accumulators SILENT for longer than
+    _STREAM_STUCK_AFTER and record them as finished=0 streams rows plus a
+    `stuck_stream` warning signal so the silent failure is observable.
+
+    Liveness is measured from per-accumulator ``last_seen`` (updated on every
+    on_stream_delta), NOT from ``started``: a legitimate long generation (e.g.
+    a big analysis turn) streams tokens for > _STREAM_STUCK_AFTER and the old
+    age-only check swept it as "stuck" the next time any new stream started,
+    producing a false stuck_stream warning, a bogus finished=0 row, and a
+    duplicate late-end row. Accumulators predating the last_seen field fall
+    back to ``started`` so genuinely hung streams are still caught.
     """
     now = time.time()
     stuck = []
     with _STREAM_LOCK:
         for key, st in list(_STREAMS.items()):
-            if now - st.get("started", now) > _STREAM_STUCK_AFTER:
+            last_seen = st.get("last_seen", st.get("started", now))
+            if now - last_seen > _STREAM_STUCK_AFTER:
                 stuck.append((key, st))
         for key, _ in stuck:
             _STREAMS.pop(key, None)
@@ -734,6 +743,8 @@ def _sweep_stuck_streams() -> int:
         return 0
     for (session_id, turn_id), st in stuck:
         started = st.get("started", now)
+        last_seen = st.get("last_seen", started)
+        idle_s = max(0, now - last_seen)
         try:
             _wave_insert(
                 "streams",
@@ -751,7 +762,10 @@ def _sweep_stuck_streams() -> int:
                 kind_counts=json.dumps(st.get("kinds", {}), default=str),
                 first_token_ms=st.get("first_token_ms"),
                 finished=0,
-                error="stuck: no on_stream_end (provider hang or dropped hook)",
+                error=(
+                    "stuck: no on_stream_end (provider hang or dropped hook) — "
+                    f"idle {idle_s:.0f}s after {st.get('deltas', 0)} delta(s)"
+                ),
                 duration_ms=int((now - started) * 1000),
             )
             if SETTINGS.get("stream_signals", True):
@@ -761,7 +775,8 @@ def _sweep_stuck_streams() -> int:
                     "Stuck LLM stream",
                     f"Streaming response never finished: session "
                     f"{str(session_id or '')[:8]}, turn {str(turn_id or '')[:8]} "
-                    f"(no on_stream_end after {(now - started):.0f}s).",
+                    f"(idle {idle_s:.0f}s, no on_stream_end after "
+                    f"{(now - started):.0f}s).",
                     session_id or "",
                 )
         except Exception as exc:
@@ -786,9 +801,11 @@ def _on_stream_start(
     except Exception:
         pass
     key = (str(session_id or ""), str(turn_id or ""))
+    now = time.time()
     with _STREAM_LOCK:
         _STREAMS[key] = {
-            "started": time.time(),
+            "started": now,
+            "last_seen": now,
             "chars": 0,
             "deltas": 0,
             "kinds": {},
@@ -824,6 +841,7 @@ def _on_stream_delta(
         st = _STREAMS.get(key)
         if st is None:
             return
+        st["last_seen"] = time.time()
         st["deltas"] += 1
         st["chars"] += len(delta or "")
         st["kinds"][kind] = st["kinds"].get(kind, 0) + 1

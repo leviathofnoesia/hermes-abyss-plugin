@@ -151,6 +151,100 @@ def _run_script():
     else:
         print("  [SKIP] incident triage (no incidents seeded)")
 
+    # --- Triage filters over REST ---------------------------------------------
+    # The Aug-2026 triage filters (type/severity/state on /signals,
+    # severity/open on /incidents) shipped core-side with zero HTTP-contract
+    # coverage: only test_plugin.py exercised them through handle_request().
+    # These checks prove the FastAPI layer forwards every parameter end-to-end:
+    # query string -> plugin_api._delegate -> handle_request -> SQL clauses.
+    print("=== Triage filter contract (REST) ===")
+    _AB = "/api/plugins/abyss"
+
+    for _sess, _sev in (("api-triage-warn", "warning"), ("api-triage-warn", "warning"),
+                        ("api-triage-err", "error"), ("api-triage-err", "error")):
+        r = client.post(f"{_AB}/signals/self-diagnostic", json={
+            "session_id": _sess, "capability": "triage_probe",
+            "gap": f"{_sev} probe", "severity": _sev,
+        })
+        check(f"seed self-diagnostic {_sess}/{_sev}",
+              r.status_code == 200 and r.json().get("status") == "recorded", str(r.json()))
+
+    def _mine(rows, sess):
+        return [row for row in rows if row.get("session_id") == sess]
+
+    r = client.get(f"{_AB}/signals", params={"state": "open"})
+    _warn = _mine(r.json(), "api-triage-warn")
+    _err = _mine(r.json(), "api-triage-err")
+    check("GET /signals state=open lists seeds", r.status_code == 200 and len(_warn) == 2 and len(_err) == 2,
+          f"warn={len(_warn)} err={len(_err)}")
+    _warn_ids = {s["id"] for s in _warn}
+    _err_ids = {s["id"] for s in _err}
+
+    r = client.get(f"{_AB}/signals", params={"type": "self_diagnostic", "state": "open"})
+    _typed = _mine(r.json(), "api-triage-warn") + _mine(r.json(), "api-triage-err")
+    check("GET /signals type filter",
+          len(_typed) == 4 and all(s.get("signal_type") == "self_diagnostic" for s in _typed))
+
+    r = client.get(f"{_AB}/signals", params={"severity": "error", "state": "open"})
+    _got = {s["id"] for s in r.json()}
+    check("GET /signals severity=error&state=open exact", _got == _err_ids,
+          f"{sorted(_got)} vs {sorted(_err_ids)}")
+
+    r = client.get(f"{_AB}/signals", params={"severity": "warning", "state": "unack"})
+    _got = {s["id"] for s in r.json()}
+    check("GET /signals severity=warning&state=unack exact", _got == _warn_ids)
+
+    r = client.get(f"{_AB}/signals", params={
+        "type": "self_diagnostic", "severity": "error", "state": "open"})
+    _got = {s["id"] for s in r.json()}
+    check("GET /signals type+severity+state combined", _got == _err_ids)
+
+    # Unknown state -> clean 400 envelope. HTTP stays 200 by design: the
+    # dispatcher never raises, callers read the JSON error/code envelope.
+    r = client.get(f"{_AB}/signals", params={"state": "bogus"})
+    check("GET /signals invalid state -> 400 envelope",
+          r.status_code == 200 and r.json().get("code") == 400
+          and "state" in r.json().get("error", ""), str(r.json()))
+
+    # Cluster the four probes: one warning incident (warn pair) + one error
+    # incident (err pair); each inherits its members' max severity.
+    r = client.post(f"{_AB}/incidents/cluster")
+    check("POST /incidents/cluster (probes)",
+          r.status_code == 200 and "incidents_created" in r.json(), str(r.json()))
+
+    r = client.get(f"{_AB}/incidents", params={"open": True})
+    _inc = {i.get("session_ids"): i for i in r.json()
+            if i.get("session_ids") in ("api-triage-warn", "api-triage-err")}
+    check("GET /incidents open=1 lists probe incidents",
+          set(_inc) == {"api-triage-warn", "api-triage-err"}, str(list(_inc)))
+    _warn_inc = _inc.get("api-triage-warn") or {}
+    _err_inc = _inc.get("api-triage-err") or {}
+    check("probe incidents inherit max member severity",
+          _warn_inc.get("severity") == "warning" and _err_inc.get("severity") == "error",
+          f"warn={_warn_inc.get('severity')} err={_err_inc.get('severity')}")
+
+    r = client.get(f"{_AB}/incidents", params={"severity": "error", "open": True})
+    _got = {i["id"] for i in r.json()}
+    check("GET /incidents severity=error&open=1 exact",
+          bool(_err_inc) and _err_inc["id"] in _got
+          and bool(_warn_inc) and _warn_inc["id"] not in _got)
+
+    r = client.get(f"{_AB}/incidents", params={"status": "resolved", "open": True})
+    check("GET /incidents open=1 + conflicting status -> 400 envelope",
+          r.status_code == 200 and r.json().get("code") == 400, str(r.json()))
+
+    # Acknowledging a signal drops it from state=unack but keeps it in state=open
+    _acked = sorted(_warn_ids)[0]
+    r = client.post(f"{_AB}/signals/{_acked}/acknowledge")
+    check("POST acknowledge probe signal",
+          r.status_code == 200 and r.json().get("status") == "acknowledged")
+    r = client.get(f"{_AB}/signals", params={"severity": "warning", "state": "unack"})
+    check("acked signal leaves state=unack",
+          {s["id"] for s in r.json()} == _warn_ids - {_acked})
+    r = client.get(f"{_AB}/signals", params={"severity": "warning", "state": "open"})
+    check("acked signal stays in state=open",
+          {s["id"] for s in r.json()} >= _warn_ids)
+
     # POST /prune
     r = client.post("/api/plugins/abyss/prune", json={"days": 365})
     check("POST /prune", r.status_code == 200 and r.json().get("status") == "ok" and "deleted" in r.json())

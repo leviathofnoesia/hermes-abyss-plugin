@@ -47,7 +47,7 @@
 import {
   cn, host, Button, Badge, Codicon, EmptyState, ErrorState,
   SearchField, Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
-  Tabs, TabsList, TabsTrigger, GlyphSpinner
+  Tabs, TabsList, TabsTrigger, GlyphSpinner, CopyButton
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 import { useEffect, useState, useMemo, useCallback, useRef, Component } from 'react'
@@ -215,23 +215,24 @@ const formatDateISO = (date) => {
   return `${y}-${m}-${d}`
 }
 // Incidents store their sessions as `session_ids` (TEXT — possibly a
-// comma-separated list or a JSON array); resolve the first usable id.
-const firstSessionId = (v) => {
-  if (!v) return null
-  if (Array.isArray(v)) return v[0] || null
-  if (typeof v === 'string') {
-    const t = v.trim()
-    if (!t || t === '[]' || t === 'null' || t === 'none') return null
-    if (t.startsWith('[')) {
-      try {
-        const arr = JSON.parse(t)
-        return Array.isArray(arr) && arr[0] ? String(arr[0]) : null
-      } catch (e) { return null }
-    }
-    return t.split(/[,;]/)[0].trim() || null
+// comma-separated list or a JSON array). Both readers below share ONE parser so
+// the "first id" the trace drill uses and the "all ids" the copy affordance
+// hands the clipboard can never disagree about what the field contains.
+const sessionIdList = (v) => {
+  if (!v) return []
+  if (Array.isArray(v)) return v.filter(Boolean).map(String)
+  if (typeof v !== 'string') return [String(v)]
+  const t = v.trim()
+  if (!t || t === '[]' || t === 'null' || t === 'none') return []
+  if (t.startsWith('[')) {
+    try {
+      const arr = JSON.parse(t)
+      return Array.isArray(arr) ? arr.filter(Boolean).map(String) : []
+    } catch (e) { return [] }
   }
-  return String(v)
+  return t.split(/[,;]/).map(s => s.trim()).filter(Boolean)
 }
+const firstSessionId = (v) => sessionIdList(v)[0] || null
 
 // ---------------------------------------------------------------------------
 // Phosphor console style — injected once. Every color below is a theme var;
@@ -816,6 +817,41 @@ class PhosphorGraphRenderer {
 
 // ==================== COMPONENTS ====================
 
+// --- Session-id copy affordance (tick-54) ---
+// The session id is this instrument's join key: everything an operator pastes
+// the id INTO lives outside the plugin — sqlite (`activities.session_id`),
+// `hermes sessions`, the gateway log, a bug report. Until now every surface
+// printed an 8-char abbreviation and kept the full value in a hover `title`, so
+// the operator could READ the id but never GET it out: the only path was
+// manual text selection across a monospace micro-label. Every session label now
+// carries a copy affordance.
+//
+// Two deliberate choices:
+//   1. The SDK's `CopyButton`, not a hand-rolled clipboard call. The host's
+//      writer prefers `window.hermesDesktop.writeClipboard` (the Electron IPC
+//      bridge) and only then falls back to `navigator.clipboard`, which is the
+//      order that works from a Blob-URL plugin document; CopyButton also owns
+//      the copied/failed feedback, the aria labels and the theme styling.
+//      Verified present in the SHIPPED bundle before importing it —
+//      `CopyButton:()=>fo` in the sdk namespace chunk
+//      (apps/desktop/dist/assets/session-list-density-*.js) — because a name
+//      the runtime shim does not re-export throws at load and takes the whole
+//      plugin down with it.
+//   2. The tooltip is the FULL id. `title` feeds CopyButton's idle tooltip, so
+//      hovering the affordance both discloses the value and offers to copy it;
+//      the `aria-label` stays the readable verb.
+function CopySid({ value, appearance, className, label }) {
+  if (!value) return null
+  const full = String(value)
+  return jsx(CopyButton, {
+    appearance: appearance || 'tool-row',
+    text: full,
+    className,
+    label: label || 'Copy session id',
+    title: `copy session id — ${full}`
+  })
+}
+
 // --- Masthead + status strip (health at a glance) ---
 function StatusStrip({ ctx, onNavigate }) {
   const [stats, setStats] = useState(null)
@@ -1223,7 +1259,12 @@ function ActivityFeed({ ctx, onOpenTrace }) {
             jsxs('div', {
               key: entry.id,
               className: cn(
-                'px-3 py-2 flex items-start gap-2.5 abyss-row-hover',
+                // group/tool-row drives the hover-revealed copy glyph
+                // (tick-54): the whole 50-row feed stays glyph-free until the
+                // operator's cursor lands on a row. The class is not a
+                // Tailwind utility to compile — it matches the host's existing
+                // `.group-hover\/tool-row\:opacity-100` rule.
+                'group/tool-row px-3 py-2 flex items-start gap-2.5 abyss-row-hover',
                 idx < activities.length - 1 && 'border-b border-(--ui-stroke-tertiary)'
               ),
               children: [
@@ -1262,13 +1303,14 @@ function ActivityFeed({ ctx, onOpenTrace }) {
                         entry.session_id && jsx('span', {
                           className: 'abyss-micro text-(--ui-text-quaternary) abyss-mono',
                           title: entry.session_id,
-                          children: `sid ${entry.session_id.slice(0, 8)}`
+                          children: `sid ${String(entry.session_id).slice(0, 8)}`
                         }),
+                        entry.session_id && jsx(CopySid, { value: entry.session_id }),
                         entry.session_id && onOpenTrace && jsx(Button, {
                           variant: 'ghost', size: 'xs',
                           onClick: () => onOpenTrace(entry.session_id),
                           title: 'Open this session trace',
-                          'aria-label': `Open trace for session ${entry.session_id.slice(0, 8)}`,
+                          'aria-label': `Open trace for session ${String(entry.session_id).slice(0, 8)}`,
                           className: 'abyss-tiny abyss-mono h-6 px-1.5',
                           children: 'trace ›'
                         })
@@ -2417,38 +2459,52 @@ function TracingView({ ctx, presetSessionId, onPresetConsumed }) {
           })
         ]
       }),
-      jsx('div', {
-        className: 'px-3 py-2 border-b border-(--ui-stroke-tertiary)',
-        children: jsx(Select, {
-          value: selectedSession || '',
-          onValueChange: setSelectedSession,
-          children: [
-            jsx(SelectTrigger, {
-              className: 'w-full text-xs abyss-mono',
-              children: jsx(SelectValue, { placeholder: 'select session…' })
-            }),
-            jsx(SelectContent, {
-              children: sessionOptions.map(s =>
-                s.synthetic
-                  ? jsx(SelectItem, {
-                      key: s.session_id,
-                      value: s.session_id,
-                      children: `${s.session_id?.slice(0, 8) || 'unknown'}… (drill)`
-                    })
-                  : jsxs(SelectItem, {
-                      key: s.session_id,
-                      value: s.session_id,
-                      children: [
-                        `${s.session_id?.slice(0, 8) || 'unknown'}… (${s.activity_count || 0} events`,
-                        s.error_count > 0 ? `, ${s.error_count}✗` : '',
-                        s.llm_count > 0 ? `, ${s.llm_count}◆` : '',
-                        ')'
-                      ]
-                    })
-              )
+      jsxs('div', {
+        className: 'px-3 py-2 border-b border-(--ui-stroke-tertiary) flex items-center gap-2',
+        children: [
+          // The Select needs a flex child wrapper of its own: the SDK `Select`
+          // is a Radix Root and renders NO host node, so it cannot take
+          // `flex-1` — the trigger inside is `w-full` and fills this wrapper.
+          jsx('div', {
+            className: 'flex-1 min-w-0',
+            children: jsx(Select, {
+              value: selectedSession || '',
+              onValueChange: setSelectedSession,
+              children: [
+                jsx(SelectTrigger, {
+                  className: 'w-full text-xs abyss-mono',
+                  children: jsx(SelectValue, { placeholder: 'select session…' })
+                }),
+                jsx(SelectContent, {
+                  children: sessionOptions.map(s =>
+                    s.synthetic
+                      ? jsx(SelectItem, {
+                          key: s.session_id,
+                          value: s.session_id,
+                          children: `${s.session_id?.slice(0, 8) || 'unknown'}… (drill)`
+                        })
+                      : jsxs(SelectItem, {
+                          key: s.session_id,
+                          value: s.session_id,
+                          children: [
+                            `${s.session_id?.slice(0, 8) || 'unknown'}… (${s.activity_count || 0} events`,
+                            s.error_count > 0 ? `, ${s.error_count}✗` : '',
+                            s.llm_count > 0 ? `, ${s.llm_count}◆` : '',
+                            ')'
+                          ]
+                        })
+                  )
+                })
+              ]
             })
-          ]
-        })
+          }),
+          // Copy the FULL session id (tick-54). The trigger and every dropdown
+          // row print the 8-char abbreviation, so the id an operator needs for
+          // sqlite / `hermes sessions` / the gateway log was the one thing the
+          // trace view could not hand over. Always visible: this is the single
+          // session the whole view is about.
+          jsx(CopySid, { value: selectedSession, appearance: 'icon', className: 'shrink-0', label: 'Copy session id' })
+        ]
       }),
       mode !== 'list' ? (mode === 'graph'
         ? jsx(TraceGraphView, { ctx, session: selectedSession })
@@ -3066,6 +3122,11 @@ function SignalsIncidentsView({ ctx, onOpenTrace }) {
                             className: 'abyss-micro text-(--ui-text-quaternary) mt-1 abyss-mono flex items-center gap-2',
                             children: [
                               jsx('span', { className: 'truncate', title: `session: ${s.session_id || '—'}  source: ${s.source || '—'}`, children: `session: ${s.session_id?.slice(0, 8) || '—'}  source: ${s.source || '—'}` }),
+                              // Watch is the triage surface: the signal's session
+                              // id is what the operator takes to the trace tab,
+                              // the DB, or a report — always visible here (only
+                              // a handful of rows, unlike the 50-row feed).
+                              jsx(CopySid, { value: s.session_id, appearance: 'icon', label: 'Copy signal session id' }),
                               s.session_id && onOpenTrace && jsx(Button, {
                                 variant: 'ghost', size: 'xs',
                                 onClick: () => onOpenTrace(s.session_id),
@@ -3162,16 +3223,30 @@ function SignalsIncidentsView({ ctx, onOpenTrace }) {
                       jsx('span', { title: timeTitle(i.created_at), children: `created: ${relativeTime(i.created_at)}` })
                     ]
                   }),
-                  firstSessionId(i.session_ids) && onOpenTrace && jsx('div', {
-                    className: 'mt-1',
-                    children: jsx(Button, {
-                      variant: 'ghost', size: 'xs',
-                      onClick: () => onOpenTrace(firstSessionId(i.session_ids)),
-                      title: 'Open this incident session trace',
-                      'aria-label': 'Open trace for incident session',
-                      className: 'abyss-tiny abyss-mono h-6 px-1.5',
-                      children: 'trace ›'
-                    })
+                  firstSessionId(i.session_ids) && onOpenTrace && jsxs('div', {
+                    className: 'mt-1 flex items-center gap-2',
+                    children: [
+                      jsx(Button, {
+                        variant: 'ghost', size: 'xs',
+                        onClick: () => onOpenTrace(firstSessionId(i.session_ids)),
+                        title: 'Open this incident session trace',
+                        'aria-label': 'Open trace for incident session',
+                        className: 'abyss-tiny abyss-mono h-6 px-1.5',
+                        children: 'trace ›'
+                      }),
+                      // An incident carries EVERY session that tripped it
+                      // (`session_ids`), but the drill above can only reach the
+                      // first — so the clipboard gets the whole list, one id per
+                      // line, and the aria-label says how many. This is the only
+                      // surface where the secondary ids are visible at all.
+                      jsx(CopySid, {
+                        value: sessionIdList(i.session_ids).join('\n'),
+                        appearance: 'icon',
+                        label: sessionIdList(i.session_ids).length > 1
+                          ? `Copy all ${sessionIdList(i.session_ids).length} incident session ids`
+                          : 'Copy incident session id'
+                      })
+                    ]
                   }),
                   jsxs('div', {
                     className: 'flex gap-1.5 mt-2 flex-wrap',
@@ -5917,3 +5992,48 @@ export default {
 //   plain digits ignored, alt+9 out of range ignored) passes. No new
 //   imports, zero fetch paths touched, no class tokens added. No backend/
 //   Python touched.
+//
+// night-shift-tick-54 (this shift): copyable session ids — the join key escapes
+// the instrument. Every surface of Abyss printed an 8-char session abbreviation
+// and kept the full uuid in a hover `title`, so an operator could READ the id
+// but never GET it out; the only path was manual text selection across a
+// monospace micro-label. Yet the id is exactly what gets pasted somewhere else:
+// sqlite (`activities.session_id`), `hermes sessions`, the gateway log, a bug
+// report. Now:
+//   1. `CopySid` — one helper over the SDK's `CopyButton` (which routes the
+//      write through the host's electron-IPC-first `writeClipboardText`, the
+//      order that works from a Blob-URL document, and owns the copied/failed
+//      feedback + aria labels). Its tooltip prints the FULL id, so the hover
+//      that used to only disclose the value now also offers to copy it.
+//   2. Three sites, matched to how many rows each holds: the trace header
+//      (`appearance: 'icon'`, always visible — the whole view is about that one
+//      session; its `Select` gained a `flex-1 min-w-0` child wrapper because a
+//      Radix Root renders no node to flex), the watch/signal session line
+//      (icon, always visible — the triage surface), and the activity feed
+//      (`appearance: 'tool-row'` — a hover-revealed glyph, so the 50-row feed
+//      stays glyph-free until the cursor lands on a row; the row gained the
+//      host's `group/tool-row` marker class).
+//   3. Incidents carry EVERY session that tripped them (`session_ids`) while
+//      the trace drill can only reach the first — so the clipboard gets the
+//      whole list, one id per line, and the aria-label states the count. This
+//      is the only surface where the secondary ids are reachable at all.
+//   4. ONE parser backs both readers: `firstSessionId` is now
+//      `sessionIdList(v)[0] || null` over a shared `sessionIdList()` (identical
+//      semantics, incl. the JSON-array / comma-semicolon / 'none' branches), so
+//      the id the drill opens and the ids the clipboard receives can never
+//      disagree about what the field contained.
+// Also hardened while there: the activity row's `sid` label and its trace
+// button's aria-label now String()-wrap `entry.session_id` (the neighbouring
+// call sites already did; a numeric id would have thrown during render).
+// Verified post-edit: node --input-type=module --check PASS + CJS check OK;
+// string-aware brace/paren balance clean (brace, paren and class checkers all
+// clean); hook order unchanged (CopySid is a plain component with no hooks);
+// extracted-source unit test of `sessionIdList`/`firstSessionId` green on
+// null/'none'/'[]'/JSON-array/CSV/array/scalar inputs; every new class token
+// verified present in the live compiled bundle (index-D_iZE9zV.css): size-6,
+// place-items-center, text-muted-foreground\/70, hover:bg-accent\/55,
+// focus-visible:opacity-100, disabled:opacity-40, transition-opacity,
+// rounded-md, grid, and the host's group-hover\/tool-row:opacity-100 rule.
+// `CopyButton` verified exported by the SHIPPED sdk namespace chunk before
+// being imported (a name the runtime shim lacks kills the whole plugin at
+// load). No fetch paths, no backend/Python touched.

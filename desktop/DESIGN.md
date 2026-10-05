@@ -141,6 +141,18 @@ Host theme variables only — no hex/rgb literals in the artifact.
   backend failure uses ErrorState + retry.
 - **Status chip:** `abyss` + health score (or open-signal count) with health dot,
   navigates to `/abyss`; fetches `/status` (not the old LLM-count).
+- **Session-id copy:** the session id is the instrument's join key — everything
+  it gets pasted into (sqlite, `hermes sessions`, the gateway log, a report)
+  lives outside the plugin — but every surface prints only the 8-char
+  abbreviation. Each session label therefore carries a copy affordance (SDK
+  `CopyButton`, so the write rides the host's electron-IPC clipboard path):
+  icon-only on the trace header and the watch/signal session line (few rows,
+  always visible), hover-revealed (`tool-row`) on activity rows so the 50-row
+  feed stays glyph-free until the cursor lands on a row. The tooltip prints the
+  FULL id, and incident rows copy the whole `session_ids` list, one id per line,
+  with the count in the aria-label — the trace drill can only reach the first.
+  Both the drill's "first id" and the clipboard's list come from one
+  `sessionIdList()` parser, so they can never disagree.
 
 ## States
 

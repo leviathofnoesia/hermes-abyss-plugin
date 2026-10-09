@@ -136,9 +136,16 @@ Host theme variables only — no hex/rgb literals in the artifact.
   breakdown bars, 7-day trend bars, failure taxonomy. No cards, no stat
   monument: it prints like a diagnostic report.
 - **Wave (telemetry):** `$ abyss wave` header, a surface/count/last terminal
-  table (8 surfaces, tone dot + colored micro label + tabular count), then the
-  merged hairline feed. Loading prints "listening for wave telemetry…";
-  backend failure uses ErrorState + retry.
+  table (8 surfaces, tone dot + colored micro label + tabular count), then a
+  surface filter chip row (`all` + one chip per surface, ActivityFeed parity —
+  the merged feed's tags are otherwise non-interactive color dots), then the
+  merged hairline feed. Filtering is client-side over the assembled slices —
+  no extra fetch, and the 40+ cap marker stays on the RAW feed (a filtered
+  view showing 6 approvals must not claim "more exist"); a filter with zero
+  rows in the window prints "no <surface> wave activity" instead of stranding
+  the previous slice under the highlighted chip (tick-31 honesty precedent).
+  Loading prints "listening for wave telemetry…"; backend failure uses
+  ErrorState + retry.
 - **Status chip:** `abyss` + health score (or open-signal count) with health dot,
   navigates to `/abyss`; fetches `/status` (not the old LLM-count).
 - **Session-id copy:** the session id is the instrument's join key — everything

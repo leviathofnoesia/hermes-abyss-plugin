@@ -491,9 +491,14 @@ def _ensure_tables() -> None:
 
 
 def _wave_rows(table: str, limit: int = 50, where: str = "", args: Optional[list] = None) -> list:
-    """Read recent rows from a wave table."""
+    """Read recent rows from a wave table.
+
+    ``limit`` is bounded here as well as at the router (defense in depth):
+    SQLite reads a NEGATIVE ``LIMIT`` as "no upper bound", so a direct caller
+    passing ``-1`` would materialise the entire table.
+    """
     try:
-        from __init__ import _get_activity_conn
+        from __init__ import _get_activity_conn, _clamp_limit
 
         _ensure_tables()
         conn = _get_activity_conn()
@@ -502,7 +507,7 @@ def _wave_rows(table: str, limit: int = 50, where: str = "", args: Optional[list
             if where:
                 sql += f" WHERE {where}"
             sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
-            rows = conn.execute(sql, (args or []) + [limit]).fetchall()
+            rows = conn.execute(sql, (args or []) + [_clamp_limit(limit, 50)]).fetchall()
             return [dict(r) for r in rows]
         finally:
             conn.close()
@@ -1506,26 +1511,28 @@ def wave_handle(method: str, path: str, params: dict = None, body: str = None):
     # Reuse the core's hardened int coercion instead of a bare
     # `int(params.get("limit", 50))`: that pattern returns None when the key is
     # present with an explicit null, and `int(None)` raised a TypeError -> 500 +
-    # traceback on all eight list endpoints. `_int_param` also turns a
-    # non-numeric value into a clean 400 via _BadRequest.
-    from __init__ import _int_param
+    # traceback on all eight list endpoints. `_limit_param` also turns a
+    # non-numeric value into a clean 400 via _BadRequest, and BOUNDS the value
+    # (a negative LIMIT means "no upper bound" to SQLite, so `?limit=-1` used to
+    # dump the whole table; anything above _LIMIT_CEILING is clamped).
+    from __init__ import _limit_param
 
     if method == "GET" and path == "/wave/events":
-        return list_wave_events(limit=_int_param(params, "limit", 50))
+        return list_wave_events(limit=_limit_param(params, "limit", 50))
     if method == "GET" and path == "/wave/streams":
-        return list_streams(limit=_int_param(params, "limit", 50))
+        return list_streams(limit=_limit_param(params, "limit", 50))
     if method == "GET" and path == "/wave/api":
-        return list_api_requests(limit=_int_param(params, "limit", 50))
+        return list_api_requests(limit=_limit_param(params, "limit", 50))
     if method == "GET" and path == "/wave/subagents":
-        return list_subagents(limit=_int_param(params, "limit", 50))
+        return list_subagents(limit=_limit_param(params, "limit", 50))
     if method == "GET" and path == "/wave/approvals":
-        return list_approvals(limit=_int_param(params, "limit", 50))
+        return list_approvals(limit=_limit_param(params, "limit", 50))
     if method == "GET" and path == "/wave/commands":
-        return list_commands(limit=_int_param(params, "limit", 50))
+        return list_commands(limit=_limit_param(params, "limit", 50))
     if method == "GET" and path == "/wave/platform":
-        return list_platform_events(limit=_int_param(params, "limit", 50))
+        return list_platform_events(limit=_limit_param(params, "limit", 50))
     if method == "GET" and path == "/wave/skills":
-        return list_skills(limit=_int_param(params, "limit", 50))
+        return list_skills(limit=_limit_param(params, "limit", 50))
     if method == "GET" and path == "/wave/summary":
         return wave_summary()
 

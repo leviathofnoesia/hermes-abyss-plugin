@@ -1595,6 +1595,59 @@ def _str_param(params: dict, key: str, default: str = "") -> str:
     return raw if isinstance(raw, str) else str(raw)
 
 
+# Upper bound for every caller-supplied list ``limit``. ``/export`` remains the
+# full-dump escape hatch, so no list surface needs an unbounded page.
+_LIMIT_CEILING = 1000
+
+
+def _limit_param(params: dict, key: str, default: int,
+                 maximum: int = _LIMIT_CEILING) -> int:
+    """Parse + BOUND an integer ``limit`` param.
+
+    SQLite treats a NEGATIVE ``LIMIT`` as *no upper bound*: ``?limit=-1`` on
+    /activity returned the entire activity table in one JSON response (a
+    memory/DoS hazard on the REST and desktop-IPC surfaces, and inconsistent
+    with the ``days`` window params that already clamp). Rules:
+
+      * missing / ``None`` / ``""`` -> ``default``
+      * non-numeric                  -> ``_BadRequest`` (clean 400, like ``_int_param``)
+      * negative                     -> ``default`` (an unbounded page is never intended)
+      * above ``maximum``            -> clamped to ``maximum``
+      * ``0``                        -> honoured (an explicit empty page)
+
+    Coercion (not a 400) matches the ``/trends`` precedent, where an
+    out-of-range ``days`` is clamped rather than rejected.
+    """
+    raw = params.get(key, default)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise _BadRequest(f"invalid integer for '{key}'")
+    if value < 0:
+        return default
+    return min(value, maximum)
+
+
+def _clamp_limit(value, default: int = 50, maximum: int = _LIMIT_CEILING) -> int:
+    """Never-raising LIMIT bound for direct (non-param) callers.
+
+    Used at the SQL boundary (``abyss_wave._wave_rows``) and by the slash
+    surface, whose handlers parsed ``--limit=`` with a bare
+    ``int(arg.split("=", 1)[1])`` — so ``/abyss signals --limit=abc`` raised
+    ValueError straight out of the command handler. Anything unparsable or
+    negative falls back to ``default``.
+    """
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError):
+        return default
+    if resolved < 0:
+        return default
+    return min(resolved, maximum)
+
+
 def handle_request(method: str, path: str, params: dict = None, body: str = None):
     """Handle API requests. Called by both the REST layer and plugin_api.py."""
     params = params or {}
@@ -1602,7 +1655,7 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
     try:
         if path == "/activity" and method == "GET":
             return list_activity(
-                limit=_int_param(params, "limit", 50),
+                limit=_limit_param(params, "limit", 50),
                 category=params.get("category"),
                 since=params.get("since"),
                 session_id=params.get("session_id"),
@@ -1638,7 +1691,7 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
 
         elif path == "/search" and method == "GET":
             query = _str_param(params, "q", "")
-            limit = _int_param(params, "limit", 20)
+            limit = _limit_param(params, "limit", 20)
             return global_search(query, limit)
 
         elif path == "/stats" and method == "GET":
@@ -1663,12 +1716,12 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
             return get_trends(days=days, bucket=bucket)
 
         elif path == "/failures" and method == "GET":
-            limit = _int_param(params, "limit", 15)
+            limit = _limit_param(params, "limit", 15)
             return get_failures(limit=limit)
 
         elif path == "/performance" and method == "GET":
             days = _int_param(params, "days", 7)
-            limit = _int_param(params, "limit", 20)
+            limit = _limit_param(params, "limit", 20)
             return get_performance(days=days, limit=limit)
 
         elif path == "/export" and method == "GET":
@@ -1678,28 +1731,28 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
             return get_status()
 
         elif path == "/trace/graph" and method == "GET":
-            return get_trace_graph(params.get("session_id", ""), limit=_int_param(params, "limit", 300))
+            return get_trace_graph(params.get("session_id", ""), limit=_limit_param(params, "limit", 300))
 
         elif path == "/trace/timeline" and method == "GET":
-            return get_trace_timeline(params.get("session_id", ""), limit=_int_param(params, "limit", 300))
+            return get_trace_timeline(params.get("session_id", ""), limit=_limit_param(params, "limit", 300))
 
         elif path == "/trace/agents" and method == "GET":
-            return get_agents_overview(limit=_int_param(params, "limit", 60))
+            return get_agents_overview(limit=_limit_param(params, "limit", 60))
 
         elif path == "/trace" and method == "GET":
             session_id = params.get("session_id", "")
             if session_id:
-                return get_session_trace(session_id, limit=_int_param(params, "limit", 200))
+                return get_session_trace(session_id, limit=_limit_param(params, "limit", 200))
             else:
                 # List recent sessions
-                return get_recent_sessions(limit=_int_param(params, "limit", 20))
+                return get_recent_sessions(limit=_limit_param(params, "limit", 20))
 
         elif path == "/graph" and method == "GET":
-            limit = _int_param(params, "limit", 200)
+            limit = _limit_param(params, "limit", 200)
             return get_graph_data(limit=limit)
 
         elif path == "/signals" and method == "GET":
-            limit = _int_param(params, "limit", 50)
+            limit = _limit_param(params, "limit", 50)
             session_filter = params.get("session_id")
             type_filter = params.get("type")
             severity_filter = params.get("severity")
@@ -1748,7 +1801,7 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
             return [dict(row) for row in rows]
 
         elif path == "/incidents" and method == "GET":
-            limit = _int_param(params, "limit", 50)
+            limit = _limit_param(params, "limit", 50)
             status_filter = params.get("status")
             severity_filter = params.get("severity")
             open_only = params.get("open") in (1, True, "1", "true", "True")
@@ -2535,7 +2588,7 @@ Category filters:
         state_arg = None
         for arg in argv[1:]:
             if arg.startswith("--limit="):
-                limit = int(arg.split("=", 1)[1])
+                limit = _clamp_limit(arg.split("=", 1)[1], limit)
             elif arg.startswith("--session="):
                 session_arg = arg.split("=", 1)[1]
             elif arg.startswith("--type="):
@@ -2596,7 +2649,7 @@ Category filters:
         status_filter = None
         for arg in argv[1:]:
             if arg.startswith("--limit="):
-                limit = int(arg.split("=", 1)[1])
+                limit = _clamp_limit(arg.split("=", 1)[1], limit)
             elif arg.startswith("--status="):
                 status_filter = arg.split("=", 1)[1]
 
@@ -2888,7 +2941,7 @@ Category filters:
         limit = 20
         for arg in argv[2:]:
             if arg.startswith("--limit="):
-                limit = int(arg.split("=", 1)[1])
+                limit = _clamp_limit(arg.split("=", 1)[1], limit)
         try:
             from abyss_wave import (
                 list_api_requests,

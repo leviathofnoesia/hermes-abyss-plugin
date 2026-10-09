@@ -1649,7 +1649,17 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
 
         elif path == "/trends" and method == "GET":
             days = _int_param(params, "days", 7)
-            bucket = params.get("bucket", "day") or "day"
+            bucket = _str_param(params, "bucket", "day") or "day"
+            if bucket not in ("hour", "day"):
+                # Same whitelist the slash surface enforces
+                # (/abyss trends [days] [hour|day]). An unknown bucket used to
+                # be accepted and echoed straight back while the series was
+                # built with a different step, so the response contradicted
+                # itself. Reject it like the /signals `state` enum instead of
+                # returning silently wrong chart data.
+                raise _BadRequest(
+                    "invalid value for 'bucket' (use: hour, day)"
+                )
             return get_trends(days=days, bucket=bucket)
 
         elif path == "/failures" and method == "GET":
@@ -2177,35 +2187,43 @@ def get_stats():
 
     _init_db()
     conn = _get_activity_conn()
+    # try/finally, not a bare `conn.close()` at the end: this function runs a
+    # dozen statements against the live DB, so ANY sqlite error part-way
+    # through (schema drift on an older store, a locked file, a corrupt row)
+    # used to skip the close entirely and leak the connection for the life of
+    # the web-server process. /stats is a polled endpoint — the leak
+    # accumulated one open handle + WAL reader per failing poll, which keeps
+    # the WAL from checkpointing and eventually exhausts handles.
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM activity").fetchone()[0]
+        categories = dict(Counter(r[0] for r in conn.execute("SELECT category FROM activity").fetchall()))
+        recent = [dict(r) for r in conn.execute("SELECT * FROM activity ORDER BY timestamp DESC LIMIT 5").fetchall()]
 
-    total = conn.execute("SELECT COUNT(*) FROM activity").fetchone()[0]
-    categories = dict(Counter(r[0] for r in conn.execute("SELECT category FROM activity").fetchall()))
-    recent = [dict(r) for r in conn.execute("SELECT * FROM activity ORDER BY timestamp DESC LIMIT 5").fetchall()]
+        # Error-rate + health metrics
+        errors = conn.execute("SELECT COUNT(*) FROM activity WHERE status = 'error'").fetchone()[0]
+        tools = dict(Counter(r[0] for r in conn.execute(
+            "SELECT tool_name FROM activity WHERE tool_name IS NOT NULL AND tool_name != ''").fetchall()))
+        top_tools = [{"name": k, "count": v} for k, v in sorted(tools.items(), key=lambda kv: kv[1], reverse=True)[:10]]
 
-    # Error-rate + health metrics
-    errors = conn.execute("SELECT COUNT(*) FROM activity WHERE status = 'error'").fetchone()[0]
-    tools = dict(Counter(r[0] for r in conn.execute(
-        "SELECT tool_name FROM activity WHERE tool_name IS NOT NULL AND tool_name != ''").fetchall()))
-    top_tools = [{"name": k, "count": v} for k, v in sorted(tools.items(), key=lambda kv: kv[1], reverse=True)[:10]]
+        # Signals & incidents health
+        signal_total = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+        signal_open = conn.execute("SELECT COUNT(*) FROM signals WHERE resolved = 0").fetchone()[0]
+        incident_total = conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
+        incident_open = conn.execute("SELECT COUNT(*) FROM incidents WHERE status IN ('open', 'acknowledged')").fetchone()[0]
+        signal_types = dict(Counter(r[0] for r in conn.execute("SELECT signal_type FROM signals").fetchall()))
+        top_signals = [{"type": k, "count": v} for k, v in sorted(signal_types.items(), key=lambda kv: kv[1], reverse=True)[:10]]
 
-    # Signals & incidents health
-    signal_total = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-    signal_open = conn.execute("SELECT COUNT(*) FROM signals WHERE resolved = 0").fetchone()[0]
-    incident_total = conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
-    incident_open = conn.execute("SELECT COUNT(*) FROM incidents WHERE status IN ('open', 'acknowledged')").fetchone()[0]
-    signal_types = dict(Counter(r[0] for r in conn.execute("SELECT signal_type FROM signals").fetchall()))
-    top_signals = [{"type": k, "count": v} for k, v in sorted(signal_types.items(), key=lambda kv: kv[1], reverse=True)[:10]]
-
-    # 24h window
-    day_ago = (datetime.now() - timedelta(days=1)).isoformat()
-    activity_24h = conn.execute(
-        "SELECT COUNT(*) FROM activity WHERE timestamp >= ?", (day_ago,)
-    ).fetchone()[0]
-    sessions_24h = conn.execute(
-        "SELECT COUNT(DISTINCT session_id) FROM activity WHERE timestamp >= ? AND session_id IS NOT NULL",
-        (day_ago,),
-    ).fetchone()[0]
-    conn.close()
+        # 24h window
+        day_ago = (datetime.now() - timedelta(days=1)).isoformat()
+        activity_24h = conn.execute(
+            "SELECT COUNT(*) FROM activity WHERE timestamp >= ?", (day_ago,)
+        ).fetchone()[0]
+        sessions_24h = conn.execute(
+            "SELECT COUNT(DISTINCT session_id) FROM activity WHERE timestamp >= ? AND session_id IS NOT NULL",
+            (day_ago,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
 
     cron_count = 0
     cron_dir = Path(PROFILE_HOME) / "cron"

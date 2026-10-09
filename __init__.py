@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -1573,6 +1574,27 @@ def _int_param(params: dict, key: str, default: int) -> int:
         raise _BadRequest(f"invalid integer for '{key}'")
 
 
+def _str_param(params: dict, key: str, default: str = "") -> str:
+    """Parse a string request param, tolerating an explicit None.
+
+    ``params.get(key, default)`` only falls back to ``default`` when the key is
+    ABSENT. When a caller sends the key with an explicit ``null`` (the desktop
+    IPC layer, direct ``handle_request`` callers, and the plugin's own tests all
+    do this) the default is bypassed and ``None`` flows into downstream string
+    ops (``.lower()``, LIKE patterns) — blowing up into a 500 with a full
+    traceback instead of a clean response. Exactly the failure mode documented
+    in the ``/calendar`` branch below.
+
+    None/empty falls back to ``default``; any other non-string type is coerced
+    with ``str()`` (mirroring ``_coerce_body``'s never-raise doctrine) so a
+    stray int/list still yields a searchable string rather than a crash.
+    """
+    raw = params.get(key, default)
+    if raw is None or raw == "":
+        return default
+    return raw if isinstance(raw, str) else str(raw)
+
+
 def handle_request(method: str, path: str, params: dict = None, body: str = None):
     """Handle API requests. Called by both the REST layer and plugin_api.py."""
     params = params or {}
@@ -1615,7 +1637,7 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
             return list_calendar(start, end)
 
         elif path == "/search" and method == "GET":
-            query = params.get("q", "")
+            query = _str_param(params, "q", "")
             limit = _int_param(params, "limit", 20)
             return global_search(query, limit)
 
@@ -1808,12 +1830,18 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
             # abyss-data/activity.db (active profile, home fallback, siblings).
             from abyss_doctor import _capture_status
 
+            # Validate BEFORE defaulting: `params.get(...) or 6.0` made an
+            # explicit 0 or False silently mean "6.0", so the documented
+            # `<= 0` rejection was unreachable. NaN/Inf also slipped past it
+            # (every comparison against NaN is False), and NaN then produced
+            # a false "ok" all-clear from a health check.
+            raw_staleness = params.get("max_age_hours")
             try:
-                staleness = float(params.get("max_age_hours") or 6.0)
+                staleness = 6.0 if raw_staleness in (None, "") else float(raw_staleness)
             except (TypeError, ValueError):
                 return {"error": "max_age_hours must be a number", "code": 400}
-            if staleness <= 0:
-                return {"error": "max_age_hours must be > 0", "code": 400}
+            if not math.isfinite(staleness) or staleness <= 0:
+                return {"error": "max_age_hours must be a finite number > 0", "code": 400}
             return _capture_status(staleness_hours=staleness)
 
         elif path == "/doctor/last" and method == "GET":
@@ -1881,6 +1909,11 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
                 from abyss_wave import wave_handle
 
                 return wave_handle(method, path, params, body)
+            except _BadRequest:
+                # Let the outer handler turn a malformed param into a clean
+                # 400 — this inner catch-all would otherwise downgrade it to a
+                # 500 + traceback.
+                raise
             except Exception as exc:
                 import traceback
                 return {"error": str(exc), "traceback": traceback.format_exc(), "code": 500}

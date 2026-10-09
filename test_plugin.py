@@ -1298,6 +1298,87 @@ def _run_script():
           str(vac_skip)[:140])
 
     print()
+
+    # ------------------------------------------------------------------
+    print("\nSection: explicit-None / mistyped query params (no 500s)")
+    # `params.get(key, default)` only defaults when the key is ABSENT — a
+    # caller sending the key with an explicit null bypasses the default and
+    # `None` reached `.lower()` / `int()`, producing a 500 with a full
+    # traceback. Every param site must degrade to the default (or a clean 400).
+    def _is_500(r):
+        return isinstance(r, dict) and r.get("code") == 500
+
+    reset_db()
+    _add_activity("probe_row", "searchable needle", "system", "completed")
+
+    r = handle_request("GET", "/search", {"q": None, "limit": 5})
+    check("search q=None -> no 500", not _is_500(r), str(r)[:110])
+    check("search q=None -> list result", isinstance(r, list), str(r)[:80])
+
+    bad_q = []
+    for q in (123, ["a"], {"x": 1}, True):
+        rr = handle_request("GET", "/search", {"q": q, "limit": 5})
+        if _is_500(rr):
+            bad_q.append(q)
+    check("search mistyped q -> no 500", not bad_q, f"offenders={bad_q}")
+
+    r = handle_request("GET", "/search", {"q": "needle", "limit": 5})
+    check("search normal q still works",
+          isinstance(r, list) and any("probe_row" in json.dumps(x) for x in r),
+          str(r)[:110])
+
+    # /_str_param contract
+    check("_str_param None -> default", __init__._str_param({"q": None}, "q", "") == "")
+    check("_str_param missing -> default", __init__._str_param({}, "q", "d") == "d")
+    check("_str_param int -> coerced str", __init__._str_param({"q": 7}, "q", "") == "7")
+
+    wave_paths = ("/wave/events", "/wave/streams", "/wave/api", "/wave/subagents",
+                  "/wave/approvals", "/wave/commands", "/wave/platform", "/wave/skills")
+    offender = []
+    for wp in wave_paths:
+        rr = handle_request("GET", wp, {"limit": None})
+        if _is_500(rr):
+            offender.append(wp)
+    check("wave limit=None -> no 500 on any endpoint", not offender, f"offenders={offender}")
+    check("wave limit=None default preserved",
+          not _is_500(handle_request("GET", "/wave/events", {"limit": None})),
+          "")
+
+    rr = handle_request("GET", "/wave/events", {"limit": "abc"})
+    check("wave limit non-numeric -> clean 400 (not 500)",
+          isinstance(rr, dict) and rr.get("code") == 400, str(rr)[:110])
+
+    rr = handle_request("GET", "/wave/events", {"limit": 12})
+    check("wave limit=12 still works", not _is_500(rr), str(rr)[:80])
+
+    # max_age_hours validation on the capture health check
+    for bad in (float("nan"), float("inf"), float("-inf"), 0, -1, "nan", "inf"):
+        rr = handle_request("GET", "/doctor/capture", {"max_age_hours": bad})
+        if not (isinstance(rr, dict) and rr.get("code") == 400):
+            offender.append(f"max_age_hours={bad!r}")
+    check("capture non-finite/non-positive max_age_hours -> 400",
+          not offender, f"offenders={offender}")
+
+    rr = handle_request("GET", "/doctor/capture", {})
+    check("capture default still returns verdict envelope",
+          isinstance(rr, dict) and rr.get("staleness_hours") == 6.0
+          and rr.get("status") in ("ok", "fragmented", "outage", "no_data"),
+          str(rr)[:130])
+
+    rr = handle_request("GET", "/doctor/capture", {"max_age_hours": "4.5"})
+    check("capture numeric string coerced", isinstance(rr, dict)
+          and rr.get("staleness_hours") == 4.5, str(rr)[:110])
+
+    # _capture_status must survive a bad window passed programmatically
+    from abyss_doctor import _capture_status
+    cs = _capture_status(staleness_hours=float("nan"))
+    check("_capture_status(NaN) coerces window to 6.0",
+          cs.get("staleness_hours") == 6.0, str(cs.get("staleness_hours")))
+    cs = _capture_status(staleness_hours=0)
+    check("_capture_status(0) coerces window to 6.0",
+          cs.get("staleness_hours") == 6.0, str(cs.get("staleness_hours")))
+
+    print()
     print(f"=== RESULT: {PASS} passed, {FAIL} failed ===")
 
     if FAIL:

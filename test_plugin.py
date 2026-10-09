@@ -1525,6 +1525,90 @@ def _run_script():
         __init__._get_activity_conn = _real_get_conn
 
     print()
+    print("=== 20. LIMIT bounding (unbounded-page guard) ===")
+    # SQLite reads a NEGATIVE ``LIMIT`` as "no upper bound", so `?limit=-1` on
+    # /activity returned the ENTIRE activity table in one JSON response — a
+    # memory/DoS hazard on the REST + desktop-IPC surfaces. The `days` window
+    # params were already clamped; `limit` now is too, on every list surface
+    # (core dispatcher, wave bus, slash `--limit=`).
+    from abyss_wave import emit_abyss_event, list_wave_events  # noqa: E402
+
+    _seed = __init__._LIMIT_CEILING + 60   # > ceiling so the clamp is observable
+    for _i in range(_seed):
+        _add_activity(action=f"limit_probe_{_i}", description="bulk probe row",
+                      category="tool", status="completed", session_id="sess-limit")
+    for _i in range(140):                  # > the 50 default page
+        emit_abyss_event("limitprobe", {"i": _i})
+
+    _live = len(list_activity(limit=__init__._LIMIT_CEILING * 2))  # internal call, unclamped
+    check("limit probe seeded past the ceiling", _live > __init__._LIMIT_CEILING,
+          f"rows={_live}")
+
+    _r = handle_request("GET", "/activity", {"limit": -1})
+    check("/activity limit=-1 bounded to the default page",
+          isinstance(_r, list) and len(_r) == 50,
+          f"n={len(_r) if isinstance(_r, list) else _r}")
+    _r = handle_request("GET", "/activity", {"limit": "-1"})
+    check("/activity limit='-1' (string) bounded too",
+          isinstance(_r, list) and len(_r) == 50,
+          f"n={len(_r) if isinstance(_r, list) else _r}")
+    _r = handle_request("GET", "/activity", {"limit": 10 ** 9})
+    check("/activity huge limit clamped to the ceiling",
+          isinstance(_r, list) and len(_r) == __init__._LIMIT_CEILING,
+          f"n={len(_r) if isinstance(_r, list) else _r}")
+    _r = handle_request("GET", "/activity", {"limit": 0})
+    check("/activity limit=0 still honoured (empty page)", _r == [], str(_r)[:60])
+    _r = handle_request("GET", "/activity", {"limit": "abc"})
+    check("/activity non-numeric limit still a clean 400",
+          isinstance(_r, dict) and _r.get("code") == 400, str(_r)[:60])
+
+    _w = handle_request("GET", "/wave/events", {"limit": -1})
+    check("/wave/events limit=-1 bounded to the default page",
+          isinstance(_w, list) and len(_w) == 50,
+          f"n={len(_w) if isinstance(_w, list) else _w}")
+    check("list_wave_events(-1) bounded at the _wave_rows SQL boundary",
+          len(list_wave_events(-1)) == 50, f"n={len(list_wave_events(-1))}")
+    _g = handle_request("GET", "/graph", {"limit": -1})
+    check("/graph limit=-1 -> no 500", not _is_500(_g))
+    _s = handle_request("GET", "/signals", {"limit": -1})
+    check("/signals limit=-1 -> bounded list", isinstance(_s, list), str(_s)[:60])
+
+    check("_limit_param missing -> default",
+          __init__._limit_param({}, "limit", 15) == 15)
+    check("_limit_param None -> default",
+          __init__._limit_param({"limit": None}, "limit", 15) == 15)
+    check("_limit_param negative -> default",
+          __init__._limit_param({"limit": -5}, "limit", 15) == 15)
+    check("_limit_param above ceiling -> clamped",
+          __init__._limit_param({"limit": 10 ** 9}, "limit", 15) == __init__._LIMIT_CEILING)
+    check("_limit_param zero -> 0",
+          __init__._limit_param({"limit": 0}, "limit", 15) == 0)
+    _raised = False
+    try:
+        __init__._limit_param({"limit": "abc"}, "limit", 15)
+    except __init__._BadRequest:
+        _raised = True
+    check("_limit_param non-numeric -> _BadRequest", _raised)
+    check("_clamp_limit garbage -> default", __init__._clamp_limit("abc", 20) == 20)
+    check("_clamp_limit None -> default", __init__._clamp_limit(None, 20) == 20)
+    check("_clamp_limit negative -> default", __init__._clamp_limit(-1, 20) == 20)
+    check("_clamp_limit huge -> ceiling",
+          __init__._clamp_limit(10 ** 9, 20) == __init__._LIMIT_CEILING)
+    check("_LIMIT_CEILING covers every documented default page",
+          __init__._LIMIT_CEILING >= 300, f"ceiling={__init__._LIMIT_CEILING}")
+
+    # Slash surface: `--limit=abc` used to raise ValueError straight out of the
+    # command handler (a bare int(arg.split("=", 1)[1])).
+    for _cmd in ("signals --limit=abc", "signals --limit=-1",
+                 "incidents --limit=abc", "incidents --limit=-1",
+                 "wave events --limit=abc", "wave events --limit=-1"):
+        try:
+            _out = _handle_slash(_cmd)
+            check(f"/abyss {_cmd} survives", isinstance(_out, str), str(_out)[:60])
+        except Exception as _exc:  # noqa: BLE001
+            check(f"/abyss {_cmd} survives", False, f"{type(_exc).__name__}: {_exc}")
+
+    print()
     print(f"=== RESULT: {PASS} passed, {FAIL} failed ===")
 
     if FAIL:

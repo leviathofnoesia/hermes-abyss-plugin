@@ -841,6 +841,11 @@ def _prune_data(days: int = 30, vacuum: bool = False) -> dict:
     files actually shrink on disk (DELETE alone never returns pages to the
     OS) and reports a ``vacuum`` block with per-DB byte deltas.
     """
+    # Defensive: `days` feeds timedelta() below, and this is also called from
+    # config-driven paths (retention_days) and the slash surface. An
+    # out-of-range value raises OverflowError there, so bound it at the leaf
+    # too, not just at the API dispatcher.
+    days = _clamp_days(days, 30, minimum=0)
     if days <= 0:
         base = {"activity": 0, "traces": 0, "signals": 0, "incidents": 0}
         try:
@@ -1648,6 +1653,39 @@ def _clamp_limit(value, default: int = 50, maximum: int = _LIMIT_CEILING) -> int
     return min(resolved, maximum)
 
 
+# Upper bound for every caller-supplied DAY-count window (prune retention,
+# resolve-bulk age, performance window, ...). ``datetime - timedelta(days=N)``
+# requires ``|N| <= 999_999_999``: anything larger raises
+# ``OverflowError: Python int too large to convert to C int`` (and values just
+# under the ceiling raise ``OverflowError: date value out of range`` from the
+# datetime arithmetic).
+# The REST layer declares ``days: int``, so any integer literal in the query
+# string reaches the core, and the slash surface parsed ``argv[1].isdigit()``
+# the same way — so ``/performance?days=10**12`` and
+# ``/abyss resolve-stale 999999999999`` both blew up (500 + traceback in the
+# API, an uncaught OverflowError out of the command handler). Ten years is
+# already far past any retention window an operator means.
+_DAYS_CEILING = 3650
+
+
+def _clamp_days(value, default: int = 7, minimum: int = 0,
+                maximum: int = _DAYS_CEILING) -> int:
+    """Never-raising bound for a caller-supplied day count.
+
+    Mirrors :func:`_clamp_limit` — unparsable, negative or below ``minimum``
+    falls back to ``default``; anything above ``maximum`` is clamped. Use it on
+    EVERY day count that is fed to ``timedelta(days=...)`` so an out-of-range
+    value degrades to a sane window instead of crashing the endpoint.
+    """
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError):
+        return default
+    if resolved < minimum:
+        return default
+    return min(resolved, maximum)
+
+
 def handle_request(method: str, path: str, params: dict = None, body: str = None):
     """Handle API requests. Called by both the REST layer and plugin_api.py."""
     params = params or {}
@@ -1720,7 +1758,10 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
             return get_failures(limit=limit)
 
         elif path == "/performance" and method == "GET":
-            days = _int_param(params, "days", 7)
+            # ``days`` feeds timedelta() directly, so it needs the same bound
+            # the trends window has: an unbounded value (the REST layer types
+            # it ``int``) raised OverflowError -> a 500 with a traceback.
+            days = _clamp_days(_int_param(params, "days", 7), 7, minimum=1)
             limit = _limit_param(params, "limit", 20)
             return get_performance(days=days, limit=limit)
 
@@ -1847,7 +1888,9 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
             return _resolve_signals_bulk(
                 session_prefix=(data.get("session_prefix") or None),
                 signal_type=(data.get("signal_type") or None),
-                older_than_days=_int_param(data, "older_than_days", 0) or None,
+                older_than_days=_clamp_days(
+                    _int_param(data, "older_than_days", 0), 0, minimum=0
+                ) or None,
                 close_empty_incidents=bool(data.get("close_empty_incidents", False)),
             )
 
@@ -1857,7 +1900,7 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
 
         elif path == "/prune" and method == "POST":
             data = _coerce_body(body)
-            days = _int_param(data, "days", 30)
+            days = _clamp_days(_int_param(data, "days", 30), 30, minimum=0)
             # Explicit prune calls reclaim disk by default (DELETE alone
             # never returns pages to the OS); opt out with {"vacuum": false}.
             vacuum = bool(data.get("vacuum", True)) if isinstance(data, dict) else True
@@ -1916,8 +1959,8 @@ def handle_request(method: str, path: str, params: dict = None, body: str = None
         elif path == "/prune-resolutions" and method == "POST":
             data = _coerce_body(body)
             return _prune_resolutions(
-                retention_days=_int_param(data, "days", 30),
-                keep_recent=_int_param(data, "keep_recent", 20),
+                retention_days=_clamp_days(_int_param(data, "days", 30), 30, minimum=0),
+                keep_recent=_clamp_limit(_int_param(data, "keep_recent", 20), 20),
             )
 
         elif path == "/doctor/approve" and method == "POST":
@@ -2526,7 +2569,7 @@ Category filters:
             elif arg.startswith("--session="):
                 session_id = arg.split("=", 1)[1]
             elif arg.isdigit():
-                n = int(arg)
+                n = _clamp_limit(arg, n)
 
         activities = list_activity(limit=n, category=category, session_id=session_id)
         if not activities:
@@ -2725,7 +2768,7 @@ Category filters:
           empty_stream for flood cleanup, --type tool_error
         - close: also close incidents left with zero open signals
         """
-        days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 7
+        days = _clamp_days(argv[1], 7, minimum=1) if len(argv) > 1 else 7
         prefix = None
         sig_type = None
         close_incidents = False
@@ -2794,7 +2837,7 @@ Category filters:
 
     if sub == "prune":
         """Delete data older than N days: /abyss prune [days]"""
-        days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 30
+        days = _clamp_days(argv[1], 30, minimum=0) if len(argv) > 1 else 30
         deleted = _prune_data(days, vacuum=True)
         vac = deleted.pop("vacuum", None)
         msg = f"✓ Pruned data older than {days} days: {deleted}"
@@ -2814,7 +2857,7 @@ Category filters:
 
     if sub == "trends":
         """Show activity/signal trends: /abyss trends [days] [hour|day]"""
-        days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 7
+        days = _clamp_days(argv[1], 7, minimum=1, maximum=365) if len(argv) > 1 else 7
         bucket = argv[2] if len(argv) > 2 and argv[2] in ("hour", "day") else "day"
         t = get_trends(days=days, bucket=bucket)
         if not t["timestamps"]:
@@ -2827,7 +2870,7 @@ Category filters:
 
     if sub == "failures":
         """Show root-cause failure taxonomy: /abyss failures [limit]"""
-        limit = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 10
+        limit = _clamp_limit(argv[1], 10) if len(argv) > 1 else 10
         f = get_failures(limit=limit)
         lines = ["Abyss failure taxonomy:"]
         if f["by_type"]:
@@ -2842,8 +2885,8 @@ Category filters:
 
     if sub == "performance":
         """Show latency percentiles: /abyss performance [days] [limit]"""
-        days = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 7
-        limit = int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 10
+        days = _clamp_days(argv[1], 7, minimum=1) if len(argv) > 1 else 7
+        limit = _clamp_limit(argv[2], 10) if len(argv) > 2 else 10
         p = get_performance(days=days, limit=limit)
         lines = [f"Abyss performance (last {days}d):"]
         lines.append(

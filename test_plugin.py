@@ -1430,6 +1430,77 @@ def _run_script():
           get_trends(days="abc").get("days") == 7,
           str(get_trends(days="abc").get("days")))
 
+    # ------------------------------------------------------------------
+    print("\nSection: day-count windows bounded (OverflowError -> 500 family)")
+    # Same class of bug, different surfaces: every day count fed to
+    # timedelta() must be clamped. The REST layer types `days: int`, so any
+    # integer literal in the query string reached the core, and the slash
+    # surface parsed argv with isdigit() — `?days=10**12` and
+    # `/abyss prune 999999999999` both hit timedelta(days=N), which raises
+    # OverflowError (a 500 + traceback from the API, an uncaught exception out
+    # of the command handler). 999_999_999 (inside the int ceiling, outside
+    # the date range) raised the other OverflowError, "date value out of
+    # range" — the clamp must cover both.
+    reset_db()
+    _add_activity("perf_probe", "day-bound probe", "tool", "completed",
+                  session_id="t1", tool_name="terminal")
+
+    perf = handle_request("GET", "/performance", {"days": 10 ** 12, "limit": 20})
+    check("performance days=10**12 clamped, no error payload",
+          isinstance(perf, dict) and "error" not in perf
+          and perf.get("days") == __init__._DAYS_CEILING,
+          str(perf)[:140])
+    perf = handle_request("GET", "/performance", {"days": 999_999_999, "limit": 20})
+    check("performance days=999999999 clamped (date-range guard)",
+          isinstance(perf, dict) and perf.get("days") == __init__._DAYS_CEILING,
+          str(perf)[:140])
+    perf = handle_request("GET", "/performance", {"days": -10 ** 12, "limit": 20})
+    check("performance negative days -> default window",
+          isinstance(perf, dict) and perf.get("days") == 7, str(perf)[:140])
+    check("performance days=abc -> clean 400",
+          handle_request("GET", "/performance", {"days": "abc"}).get("code") == 400,
+          str(handle_request("GET", "/performance", {"days": "abc"}))[:110])
+
+    pr = handle_request("POST", "/prune",
+                        body=json.dumps({"days": 10 ** 12, "vacuum": False}))
+    check("POST /prune huge days clamped, no error",
+          isinstance(pr, dict) and pr.get("status") == "ok" and "deleted" in pr,
+          str(pr)[:140])
+
+    rb = handle_request("POST", "/signals/resolve-bulk",
+                        body=json.dumps({"older_than_days": 10 ** 12}))
+    check("resolve-bulk huge older_than_days survives",
+          isinstance(rb, dict) and "resolved" in rb and "error" not in rb,
+          str(rb)[:140])
+    _rb_leaf = __init__._resolve_signals_bulk(older_than_days=10 ** 12)
+    check("_resolve_signals_bulk leaf clamps older_than_days",
+          isinstance(_rb_leaf, dict) and "resolved" in _rb_leaf, str(_rb_leaf)[:120])
+
+    for argv, marker in (("performance 999999999999", "Abyss performance"),
+                         ("prune 999999999999", "Pruned data older than 3650 days"),
+                         ("resolve-stale 999999999999", "Bulk-resolved"),
+                         ("trends 999999999999 hour", None)):
+        try:
+            out = _handle_slash(argv)
+            ok = marker is None or marker in out
+        except Exception as exc:
+            out, ok = f"{type(exc).__name__}: {exc}", False
+        check(f"/abyss {argv} does not raise", ok, str(out)[:150])
+
+    check("_clamp_days ceiling/floor/unparsable contract",
+          __init__._clamp_days(10 ** 12) == __init__._DAYS_CEILING
+          and __init__._clamp_days(-1) == 7
+          and __init__._clamp_days(0, 7, minimum=1) == 7
+          and __init__._clamp_days("abc") == 7
+          and __init__._clamp_days(3) == 3,
+          f"{__init__._clamp_days(10 ** 12)}/{__init__._clamp_days(-1)}")
+    check("get_performance leaf clamps days (direct caller)",
+          get_performance(days=10 ** 12, limit=20).get("days") == __init__._DAYS_CEILING,
+          str(get_performance(days=10 ** 12, limit=20).get("days")))
+    check("_prune_data leaf tolerates huge days",
+          isinstance(__init__._prune_data(10 ** 12, vacuum=False), dict),
+          str(__init__._prune_data(10 ** 12, vacuum=False))[:110])
+
     # /status capture block: `freshest_capture_at` must be the NEWEST capture
     # across stores (min() reported the stalest store's timestamp under a
     # "freshest" name, so one quiet legacy store made the active store's fresh

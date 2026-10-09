@@ -4173,6 +4173,13 @@ function WaveView({ ctx }) {
   const [feed, setFeed] = useState([])
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
+  // Per-surface filter (tick-60): the merged feed mixes all 8 surfaces, and
+  // an operator watching one surface (approvals, skills, api…) had to scan
+  // the whole 40-item tail. ActivityFeed's category chips are the established
+  // affordance; this is the same pattern scoped to wave feeds. Client-side
+  // only: the merged feed is already assembled from the per-surface slices,
+  // so filtering needs no extra fetch and never re-sorts the master list.
+  const [surfaceFilter, setSurfaceFilter] = useState('all')
 
   const fetchAll = useCallback(() => {
     if (!ctx) return
@@ -4281,6 +4288,22 @@ function WaveView({ ctx }) {
   // instead of a silent lie.
   const summaryDown = !loading && !summary
 
+  // Filtered feed (tick-60): client-side slice of the merged tail. The
+  // surface table above carries the exact per-surface totals, so the 40+
+  // cap marker stays on the RAW feed (the sample cap belongs to the
+  // unfiltered request window, not the filtered slice — a filtered view
+  // showing 6 approvals must not claim "more exist" when the raw sample
+  // wasn't capped).
+  const visibleFeed = surfaceFilter === 'all'
+    ? feed
+    : feed.filter(it => it.tag === surfaceFilter)
+  // Filter-honesty: the chips row is part of the same glance as the feed —
+  // when a filter selectable in that row matches zero rows in the current
+  // window, the feed must say "no X wave activity" instead of silently
+  // leaving the previous slice's rows under the newly-highlighted chip
+  // (ActivityFeed tick-31 precedent).
+  const feedEmptyForFilter = feed.length > 0 && visibleFeed.length === 0
+
   return jsxs('div', {
     className: 'flex h-full flex-col overflow-auto',
     children: [
@@ -4345,6 +4368,38 @@ function WaveView({ ctx }) {
           })
         ]
       }),
+      // Surface filter chips (tick-60): parity with ActivityFeed's category
+      // chips — the merged feed's tags are non-interactive color dots, so an
+      // operator watching one surface (approvals, skills…) had to scan every
+      // row of the tail. 'all' resets; the active chip uses the default
+      // variant (same as the Activity filter). Filter-aware empty copy below
+      // keeps "no X activity" honest when a chip has no rows in the window.
+      jsxs('div', {
+        className: 'flex gap-1 px-3 py-1.5 border-b border-(--ui-stroke-tertiary) overflow-x-auto shrink-0',
+        children: [
+          jsx(Button, {
+            key: 'all',
+            variant: surfaceFilter === 'all' ? 'default' : 'ghost',
+            size: 'sm',
+            onClick: () => setSurfaceFilter('all'),
+            'aria-pressed': surfaceFilter === 'all',
+            'aria-label': 'Filter by all surfaces',
+            className: 'text-xs h-6 whitespace-nowrap abyss-mono',
+            children: 'all'
+          }),
+          ...WAVE_SURFACES.map(s => jsx(Button, {
+            key: s.key,
+            variant: surfaceFilter === s.label ? 'default' : 'ghost',
+            size: 'sm',
+            onClick: () => setSurfaceFilter(surfaceFilter === s.label ? 'all' : s.label),
+            'aria-pressed': surfaceFilter === s.label,
+            'aria-label': `Filter by ${s.label}`,
+            title: `show only ${s.label} wave items`,
+            className: 'text-xs h-6 whitespace-nowrap abyss-mono',
+            children: s.label
+          }))
+        ]
+      }),
       // Merged feed — hairline rows
       jsx('div', {
         className: 'flex-1 min-h-0 overflow-y-auto',
@@ -4363,13 +4418,18 @@ function WaveView({ ctx }) {
               title: 'No wave activity yet',
               description: 'Events, streams, API calls, subagents and approvals will appear here as they happen.'
             }) })
-          : jsx('div', {
+          : feedEmptyForFilter
+            ? jsx('div', { className: 'p-3', children: jsx(EmptyState, {
+                title: `No ${surfaceFilter} wave activity`,
+                description: `No ${surfaceFilter} items in the recent window. Other surfaces may still have activity — check the counters above.`
+              }) })
+            : jsx('div', {
               className: 'flex flex-col',
-              children: feed.map((it, idx) => jsxs('div', {
+              children: visibleFeed.map((it, idx) => jsxs('div', {
                 key: idx,
                 className: cn(
                   'flex items-start gap-2 px-3 py-1.5 abyss-row-hover',
-                  idx < feed.length - 1 && 'border-b border-(--ui-stroke-tertiary)'
+                  idx < visibleFeed.length - 1 && 'border-b border-(--ui-stroke-tertiary)'
                 ),
                 children: [
                   jsx('span', { className: 'mt-0.5 shrink-0 abyss-tiny uppercase tracking-wider abyss-mono', style: { color: WAVE_TAG_TONE[it.tag] || 'var(--ui-text-secondary)' }, children: it.tag }),

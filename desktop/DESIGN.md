@@ -153,6 +153,13 @@ Host theme variables only — no hex/rgb literals in the artifact.
   with the count in the aria-label — the trace drill can only reach the first.
   Both the drill's "first id" and the clipboard's list come from one
   `sessionIdList()` parser, so they can never disagree.
+- **Report-id copy:** the doctor's `report_id` (`doctor-<epoch>`) is the same
+  kind of join key — `/doctor/report`, `/doctor/log`, `approve` and `resume
+  last` all resolve against it — yet the panel printed it as decoration inside
+  the `running` line only, so it disappeared exactly when the review phase
+  needed it. The panel header now carries it (mono, truncated) beside an
+  icon-only `CopyButton` whose payload is the raw id, in every phase that has
+  one.
 
 ## States
 

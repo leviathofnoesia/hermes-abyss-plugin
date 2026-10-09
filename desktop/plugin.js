@@ -184,6 +184,41 @@ function idleLabel(ts) {
   const days = Math.round(hrs / 24)
   return { text: `${days}d`, tone: 'text-(--ui-red)' }
 }
+// The verdict phrase — the one sentence that answers "are my agents OK right
+// now?" (DESIGN.md FIRST VIEWPORT). Authored ONCE (tick-55): the strip printed
+// it three separate times (the nav button, the plain-span fallback, and the
+// screen-reader live region) and the copy readout below is a fourth reader, so
+// a wording or grouping change now lands in all four or in none. fmtCount
+// keeps the four-digit grouping tick-47 introduced.
+const verdictPhrase = (criticals, openSignals) =>
+  criticals > 0 ? `${fmtCount(criticals)} critical`
+    : openSignals > 0 ? `${fmtCount(openSignals)} open`
+    : 'all clear'
+// Status readout (tick-55): the glance is the one thing an operator repeats
+// OUTSIDE the instrument — in a chat message, a handover note, a bug report —
+// yet both mounts could only render it as pixels, so handing it to anyone else
+// meant a screenshot. This is the single author of the strip's clipboard
+// payload, fed the same numbers the strip is rendering at that moment (the
+// verdict comes from the shared verdictPhrase, the metrics are the strip's own
+// tile objects verbatim, grouping included), so a pasted readout can never
+// disagree with the strip the operator copied it from.
+//
+// Three lines, the instrument's own ' · ' field separator:
+//   abyss readout · Oct 9, 3:12:45 AM
+//   abyss health: 87 · fair · 12 critical · idle 2h · 1 cloud-agent fix in flight
+//   ACT 25,875 · HLTH 87 · INC 4 · CRN 12 · CAT 6 · SIG 3,382
+// The first line time-anchors the report (a pasted "12 critical" is worthless
+// without knowing when it was true; timeTitle already carries the cross-year
+// honesty rule). `verdictOverride` exists for the link-down state, where there
+// are no numbers to speak of and the failure itself is the report.
+function statusReadout({ score, level, criticals, openSignals, idle, resolvingCount, tiles, verdictOverride }) {
+  const verdict = verdictOverride || verdictPhrase(criticals || 0, openSignals || 0)
+  const health = `abyss health: ${score ?? 'unknown'}${level ? ` · ${level}` : ''} · ${verdict}`
+    + (idle ? ` · idle ${idle.text}` : '')
+    + (resolvingCount > 0 ? ` · ${resolvingCount} cloud-agent fix${resolvingCount === 1 ? '' : 'es'} in flight` : '')
+  const metrics = (tiles || []).map(t => `${t.label} ${t.value}`).join(' · ')
+  return `abyss readout · ${timeTitle(Date.now())}\n${health}${metrics ? `\n${metrics}` : ''}`
+}
 const getWeekStart = (date = new Date()) => {
   const d = new Date(date)
   d.setDate(d.getDate() - d.getDay())
@@ -974,6 +1009,19 @@ function StatusStrip({ ctx, onNavigate }) {
           onClick: fetchAll,
           children: 'retry'
         }),
+        // Copy the failure (tick-55): the link-down state is the one report an
+        // operator is MOST likely to hand to someone else ("the strip says
+        // status link down, here's when"), so the readout affordance exists
+        // here too. Same payload shape as the data branch — one line, with the
+        // failure itself as the verdict — instead of a screenshot of a red dot.
+        jsx(CopyButton, {
+          appearance: 'icon',
+          buttonSize: 'icon-xs',
+          className: 'shrink-0',
+          text: statusReadout({ score: null, verdictOverride: 'status link down' }),
+          title: 'copy status readout — status link down',
+          label: 'Copy status readout'
+        }),
         // Screen-reader parity with the data branch below (tick-27): the
         // 'status link down' line (with its retry affordance) is all visual —
         // a screen-reader operator gets zero announcement that the answer to
@@ -989,6 +1037,15 @@ function StatusStrip({ ctx, onNavigate }) {
       ]
     })
   }
+
+  // The clipboard payload (tick-55). Built from the strip's OWN rendered
+  // values — `items` is the very array the metric row maps over — so "SIG
+  // 3,382" in a pasted report is the number that was on screen when the
+  // operator copied it, formatting included.
+  const readout = statusReadout({
+    score: healthScore, level: status?.level, criticals, openSignals,
+    idle, resolvingCount, tiles: items
+  })
 
   return jsxs('div', {
     className: 'shrink-0 px-3 py-1.5 border-b border-(--ui-stroke-tertiary) flex items-center gap-4',
@@ -1038,7 +1095,10 @@ function StatusStrip({ ctx, onNavigate }) {
                 style: { backgroundColor: criticals > 0 ? 'var(--ui-red)' : openSignals > 0 ? 'var(--ui-yellow)' : 'var(--ui-green)' }
               }),
               // fmtCount (tick-47): criticals/open can exceed four digits.
-              criticals > 0 ? `${fmtCount(criticals)} critical` : openSignals > 0 ? `${fmtCount(openSignals)} open` : 'all clear',
+              // tick-55: the phrase now comes from the shared verdictPhrase()
+              // so the strip, the copy readout and the sr-only echo can never
+              // word the same numbers differently.
+              verdictPhrase(criticals, openSignals),
               idleEl,
               resolvingEl,
               '›'
@@ -1050,23 +1110,42 @@ function StatusStrip({ ctx, onNavigate }) {
                 className: 'inline-block h-1.5 w-1.5 rounded-full',
                 style: { backgroundColor: criticals > 0 ? 'var(--ui-red)' : openSignals > 0 ? 'var(--ui-yellow)' : 'var(--ui-green)' }
               }),
-              criticals > 0 ? `${fmtCount(criticals)} critical` : openSignals > 0 ? `${fmtCount(openSignals)} open` : 'all clear',
+              verdictPhrase(criticals, openSignals),
               idleEl,
               resolvingEl
             ]
+          }),
+          // Copyable readout (tick-55): the verdict is the answer an operator
+          // repeats to other humans, and the strip — the surface that computes
+          // it — had no way to hand it over. Icon-only (buttonSize icon-xs, so
+          // it sits inside the strip's 24px line box instead of the icon
+          // default's 36px), placed after the verdict so it is the rightmost
+          // thing on the strip. The clipboard payload is statusReadout() over
+          // the SAME values this render used; the tooltip names what will be
+          // copied instead of dumping the three-line report into a hover box.
+          jsx(CopyButton, {
+            appearance: 'icon',
+            buttonSize: 'icon-xs',
+            className: 'shrink-0',
+            text: readout,
+            title: `copy status readout — ${verdictPhrase(criticals, openSignals)}`,
+            label: 'Copy status readout'
           }),
           // Screen-reader parity for the glance: the strip's flash
           // (flashTick) is a purely VISUAL announcement that health numbers
           // changed — a screen-reader operator gets nothing. This sr-only
           // live region (role=status → polite announcement, not an alert)
           // echoes the verdict phrase so the "are my agents OK?" answer is
-          // spoken exactly when it changes. sr-only verified compiled in
-          // index-ChgG27Ex.css.
+          // spoken exactly when it changes. sr-only verified compiled in the
+          // live bundle (index-DHtYck30.css; re-swept this shift — the bundle
+          // hash changes with every desktop build). The phrase itself now
+          // comes from the shared verdictPhrase() (tick-55), byte-identical to
+          // the inline ternary it replaced, so no announcement changed.
           jsx('span', {
             role: 'status',
             'aria-live': 'polite',
             className: 'sr-only',
-            children: `abyss health: ${criticals > 0 ? `${fmtCount(criticals)} critical` : openSignals > 0 ? `${fmtCount(openSignals)} open` : 'all clear'}${idle ? ` · idle ${idle.text}` : ''}${resolvingCount > 0 ? ` · ${resolvingCount} resolving` : ''}`
+            children: `abyss health: ${verdictPhrase(criticals, openSignals)}${idle ? ` · idle ${idle.text}` : ''}${resolvingCount > 0 ? ` · ${resolvingCount} resolving` : ''}`
           })
         ]
       })
@@ -1714,7 +1793,14 @@ function GlobalSearch({ ctx, onOpenTrace }) {
             // fetchResults (bumps the seq, clears results + loading), so no
             // stale-response race is possible.
             onClear: () => setQuery(''),
-            ariaLabel: 'Search Abyss'
+            // Prop-contract audit (tick-55): this was `ariaLabel`, which
+            // SearchField does NOT declare — its interface is
+            // `{ 'aria-label'?: string }` (components/ui/search-field.tsx,
+            // re-exported raw by the SDK at src/sdk/index.ts:1873, no prop
+            // shim), so the intended accessible name was silently dropped and
+            // the field fell back to announcing its long placeholder. The
+            // kebab key is the one the field actually reads.
+            'aria-label': 'Search Abyss'
           }),
           jsx('div', {
             className: 'flex gap-1 flex-wrap',
@@ -3669,7 +3755,36 @@ function HealthView({ ctx }) {
           jsxs('div', {
             className: 'flex items-center justify-between mb-2',
             children: [
-              jsx('div', { className: 'text-xs uppercase tracking-widest text-(--ui-text-quaternary) abyss-mono', children: 'doctor' }),
+              jsxs('div', {
+                className: 'flex items-center gap-1.5 min-w-0',
+                children: [
+                  jsx('div', { className: 'text-xs uppercase tracking-widest text-(--ui-text-quaternary) abyss-mono', children: 'doctor' }),
+                  // Copyable report id (tick-56): doctorReportId is the handle
+                  // for everything the doctor can still do (approve, resume,
+                  // /doctor/report, /doctor/log) and the one string an operator
+                  // carries OUT of this pane — into a ticket, a handover note,
+                  // another shell. It used to appear as decoration inside the
+                  // 'running' line only, so by the review phase (the moment the
+                  // id actually gets used) it had already scrolled out of the
+                  // UI. Same affordance family as the strip readout (tick-55):
+                  // an icon-xs CopyButton whose payload is the raw, copyable
+                  // value, never a decorated label — pasted ids must be byte-
+                  // exact to resolve.
+                  doctorReportId && jsx('span', {
+                    className: 'abyss-micro abyss-mono truncate text-(--ui-text-tertiary)',
+                    title: 'doctor report id',
+                    children: doctorReportId
+                  }),
+                  doctorReportId && jsx(CopyButton, {
+                    appearance: 'icon',
+                    buttonSize: 'icon-xs',
+                    className: 'shrink-0',
+                    text: doctorReportId,
+                    title: `copy doctor report id — ${doctorReportId}`,
+                    label: 'Copy doctor report id'
+                  })
+                ]
+              }),
               jsx(Button, { variant: 'ghost', size: 'xs', onClick: dismissDoctor, children: 'dismiss' })
             ]
           }),

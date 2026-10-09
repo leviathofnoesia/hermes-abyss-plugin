@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -50,6 +51,16 @@ def _capture_status(staleness_hours: float = 6.0,
                         (split-brain: captures are landing in different DBs).
     """
     from __init__ import HERMES_HOME, PROFILE_HOME
+
+    # Defense in depth: a NaN/Inf/non-positive staleness window must never
+    # reach the verdict math. Every comparison against NaN is False, so the
+    # `outage` test fell through to the `ok` branch — a false all-clear from a
+    # health check. Coerce anything unusable back to the 6h default.
+    if (not isinstance(staleness_hours, (int, float))
+            or isinstance(staleness_hours, bool)
+            or not math.isfinite(staleness_hours)
+            or staleness_hours <= 0):
+        staleness_hours = 6.0
 
     home = Path(hermes_home) if hermes_home else Path(HERMES_HOME)
     prof = Path(profile_home) if profile_home else Path(PROFILE_HOME)

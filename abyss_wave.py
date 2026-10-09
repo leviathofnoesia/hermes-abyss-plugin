@@ -1503,22 +1503,29 @@ def wave_summary() -> dict:
 def wave_handle(method: str, path: str, params: dict = None, body: str = None):
     """Route /wave/* requests (delegated from the core handle_request)."""
     params = params or {}
+    # Reuse the core's hardened int coercion instead of a bare
+    # `int(params.get("limit", 50))`: that pattern returns None when the key is
+    # present with an explicit null, and `int(None)` raised a TypeError -> 500 +
+    # traceback on all eight list endpoints. `_int_param` also turns a
+    # non-numeric value into a clean 400 via _BadRequest.
+    from __init__ import _int_param
+
     if method == "GET" and path == "/wave/events":
-        return list_wave_events(limit=int(params.get("limit", 50)))
+        return list_wave_events(limit=_int_param(params, "limit", 50))
     if method == "GET" and path == "/wave/streams":
-        return list_streams(limit=int(params.get("limit", 50)))
+        return list_streams(limit=_int_param(params, "limit", 50))
     if method == "GET" and path == "/wave/api":
-        return list_api_requests(limit=int(params.get("limit", 50)))
+        return list_api_requests(limit=_int_param(params, "limit", 50))
     if method == "GET" and path == "/wave/subagents":
-        return list_subagents(limit=int(params.get("limit", 50)))
+        return list_subagents(limit=_int_param(params, "limit", 50))
     if method == "GET" and path == "/wave/approvals":
-        return list_approvals(limit=int(params.get("limit", 50)))
+        return list_approvals(limit=_int_param(params, "limit", 50))
     if method == "GET" and path == "/wave/commands":
-        return list_commands(limit=int(params.get("limit", 50)))
+        return list_commands(limit=_int_param(params, "limit", 50))
     if method == "GET" and path == "/wave/platform":
-        return list_platform_events(limit=int(params.get("limit", 50)))
+        return list_platform_events(limit=_int_param(params, "limit", 50))
     if method == "GET" and path == "/wave/skills":
-        return list_skills(limit=int(params.get("limit", 50)))
+        return list_skills(limit=_int_param(params, "limit", 50))
     if method == "GET" and path == "/wave/summary":
         return wave_summary()
 

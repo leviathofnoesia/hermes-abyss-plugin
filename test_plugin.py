@@ -1679,6 +1679,92 @@ def _run_script():
         except Exception as _exc:  # noqa: BLE001
             check(f"/abyss {_cmd} survives", False, f"{type(_exc).__name__}: {_exc}")
 
+    print("=== 21. Signals index coverage (post-migration hot predicates) ===")
+    # _migrate_schema adds incident_id/details/resolution_* to signals via ALTER
+    # TABLE, so the CREATE INDEX statements for those columns cannot live in the
+    # pre-migration DDL block (a fresh DB has no such column yet — the CREATE
+    # INDEX raises "no such column" inside a try block and silently skips the
+    # rest). Before these indexes existed every predicate below full-scanned
+    # signals: 5.3 ms per call on 50k rows, with /status polling the first one.
+    _expected = {"idx_signals_open", "idx_signals_unack", "idx_signals_incident"}
+    check("_SIGNAL_INDEXES declares exactly the expected indexes",
+          {spec.split(" ", 1)[0] for spec in __init__._SIGNAL_INDEXES} == _expected,
+          str(__init__._SIGNAL_INDEXES))
+    _conn = __init__._get_activity_conn()
+    try:
+        _live_idx = {r[1] for r in _conn.execute("PRAGMA index_list(signals)").fetchall()}
+    finally:
+        _conn.close()
+    check("plugin DB carries the signals indexes",
+          _expected <= _live_idx, f"missing={sorted(_expected - _live_idx)}")
+    for _name, _cols in (("idx_signals_open", "resolved,timestamp"),
+                         ("idx_signals_unack", "resolved,acknowledged,timestamp"),
+                         ("idx_signals_incident", "incident_id,resolved")):
+        _c = __init__._get_activity_conn()
+        try:
+            _row = _c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                (_name,)).fetchone()
+        finally:
+            _c.close()
+        _ddl = (_row[0] or "").replace(" ", "") if _row else ""
+        # Column ORDER is load-bearing: (resolved, acknowledged, timestamp) can
+        # index the unack count but NOT the state=open list's timestamp order.
+        check(f"{_name} column order is ({_cols})", _cols in _ddl, _ddl or "MISSING")
+
+    # Planner proof on a table with enough rows for the indexes to be chosen.
+    _plan_db = os.path.join(_TMP, "signals-index-plan.db")
+    _pc = sqlite3.connect(_plan_db)
+    try:
+        _pc.execute("""CREATE TABLE signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            resolved INTEGER DEFAULT 0,
+            acknowledged INTEGER DEFAULT 0,
+            incident_id INTEGER)""")
+        _rows = []
+        for _i in range(4000):
+            _rows.append((
+                "2026-08-%02dT00:%02d:00" % (1 + _i % 28, _i % 60),
+                0 if _i % 4 == 0 else 1,
+                0 if _i % 8 == 0 else 1,
+                (_i % 25) if _i % 3 else None,
+            ))
+        _pc.executemany("INSERT INTO signals (timestamp, resolved, acknowledged,"
+                        " incident_id) VALUES (?,?,?,?)", _rows)
+        _pc.commit()
+        _created = __init__._ensure_signal_indexes(_pc)
+        check("_ensure_signal_indexes creates all three on a bare table",
+              sorted(_created) == sorted(_expected), str(sorted(_created)))
+        check("_ensure_signal_indexes is idempotent (no re-create)",
+              __init__._ensure_signal_indexes(_pc) == [])
+        _pc.execute("ANALYZE")
+        _pc.commit()
+        for _label, _sql in (
+            ("/status chip count (resolved=0)",
+             "SELECT COUNT(*) FROM signals WHERE resolved = 0"),
+            ("triage backlog count (resolved=0 AND acknowledged=0)",
+             "SELECT COUNT(*) FROM signals WHERE resolved = 0 AND acknowledged = 0"),
+            ("get_health 7d (resolved=0 AND timestamp>=?)",
+             "SELECT COUNT(*) FROM signals WHERE resolved = 0 AND timestamp >= ?"),
+            ("cluster seed (resolved=0 AND ack=0 AND incident_id IS NULL)",
+             "SELECT id FROM signals WHERE resolved = 0 AND acknowledged = 0 "
+             "AND incident_id IS NULL ORDER BY timestamp DESC LIMIT 500"),
+            ("incident count (incident_id=1 AND resolved=0)",
+             "SELECT COUNT(*) FROM signals WHERE incident_id = 1 AND resolved = 0"),
+            ("state=open page (resolved=0 ORDER BY timestamp DESC)",
+             "SELECT id FROM signals WHERE resolved = 0 "
+             "ORDER BY timestamp DESC LIMIT 50"),
+        ):
+            _params = ("2026-08-01",) if "?" in _sql else ()
+            _detail = " | ".join(
+                _r[3] for _r in _pc.execute("EXPLAIN QUERY PLAN " + _sql, _params).fetchall())
+            check(f"plan uses a signals index: {_label}",
+                  any(_n in _detail for _n in _expected) and _detail.strip() != "SCAN signals",
+                  _detail)
+    finally:
+        _pc.close()
+
     print()
     print(f"=== RESULT: {PASS} passed, {FAIL} failed ===")
 

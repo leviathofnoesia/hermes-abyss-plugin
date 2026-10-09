@@ -149,6 +149,63 @@ def _migrate_schema(conn):
         logger.debug("Abyss schema migration skipped: %s", exc)
 
 
+# Composite indexes on `signals` whose columns are created by _migrate_schema's
+# ALTER TABLE. They deliberately live outside the CREATE INDEX block in
+# _init_db_unlocked: a fresh (or legacy) DB has no `incident_id` column at that
+# point, so the CREATE INDEX would raise "no such column" and — being inside the
+# same try block — silently skip the statements after it.
+#
+# Every predicate below is on a hot path and previously had NO index, i.e. each
+# one full-scanned signals:
+#   WHERE resolved = 0                                   /status chip (polled by
+#                                                        the desktop), get_health,
+#                                                        doctor open-signal scan
+#   WHERE resolved = 0 AND acknowledged = 0              triage backlog count,
+#                                                        incident clustering
+#   WHERE resolved = 0 AND acknowledged = 0
+#     AND incident_id IS NULL ORDER BY timestamp DESC    clustering seed scan
+#   WHERE incident_id = ? AND resolved = 0               per-incident counts
+#                                                        + bulk resolve UPDATE
+# Measured on 50k synthetic signals (see the shift report): the two open-count
+# predicates fall 5.3 -> 0.3/0.2 ms (covering index), the incident count
+# 5.5 -> 0.03 ms, and the clustering seed gets timestamp order from the index
+# instead of a temp B-tree (2.6 -> 1.2 ms). idx_signals_open is
+# (resolved, timestamp) and NOT (resolved, acknowledged, timestamp) on purpose:
+# the state=open list and the doctor scan constrain only `resolved` and order by
+# timestamp, and an index carrying `acknowledged` between them cannot supply
+# that order (measured regression: 0.13 -> 10.5 ms over a temp B-tree).
+_SIGNAL_INDEXES = (
+    "idx_signals_open ON signals(resolved, timestamp)",
+    "idx_signals_unack ON signals(resolved, acknowledged, timestamp)",
+    "idx_signals_incident ON signals(incident_id, resolved)",
+)
+
+
+def _ensure_signal_indexes(conn) -> list:
+    """Create the post-migration signals indexes; return newly created names.
+
+    Idempotent (CREATE INDEX IF NOT EXISTS) and fail-open per statement: a DB
+    opened by a path that has not migrated `incident_id` yet must not abort
+    init. Safe to call on every bootstrap — existing DBs pick the indexes up on
+    their next process start.
+    """
+    created = []
+    for spec in _SIGNAL_INDEXES:
+        name = spec.split(" ", 1)[0]
+        try:
+            existed = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+                (name,),
+            ).fetchone()
+            conn.execute(f"CREATE INDEX IF NOT EXISTS {spec}")
+        except sqlite3.Error as exc:
+            logger.debug("Abyss signal index %s skipped: %s", name, exc)
+            continue
+        if not existed:
+            created.append(name)
+    return created
+
+
 def _init_db():
     """Initialize databases if not exists (memoized after first success).
 
@@ -267,6 +324,13 @@ def _init_db_unlocked():
     # on every write (the second call migrated the now-existing tables); the
     # memoized single-init requires the correct order.
     _migrate_schema(conn)
+
+    # Post-migration signals indexes (their columns come from the ALTER TABLEs
+    # above). Runs once per process with the memoized bootstrap, so existing
+    # DBs pick them up on their next start; fail-open inside the helper.
+    _new_indexes = _ensure_signal_indexes(conn)
+    if _new_indexes:
+        logger.info("Abyss created signals indexes: %s", ", ".join(_new_indexes))
 
     # Wave tables — August 2026 plugin-interface expansion (#64182)
     try:

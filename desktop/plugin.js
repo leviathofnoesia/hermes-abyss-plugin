@@ -184,6 +184,33 @@ function idleLabel(ts) {
   const days = Math.round(hrs / 24)
   return { text: `${days}d`, tone: 'text-(--ui-red)' }
 }
+// Capture-verdict disclosure (tick-57): /status carries a backend-computed
+// multi-store capture verdict (`capture.status` = ok | fragmented | outage |
+// no_data) — the one signal that exposes the failure class a single-store
+// health view is structurally blind to. Every score and count below is built
+// from the `activity` table, so when captures stop (or split across stores)
+// the windows are simply EMPTY: /health answers a confident 90 'healthy',
+// the strip prints 'all clear', and the operator sees a green instrument over
+// a dead pipeline (verified live while writing this: score 90.0 / level
+// healthy / activity_24h 0 while capture.status === 'outage'). This verdict
+// has shipped in the /status payload since the multi-store capture work and
+// the UI never read it. Returns null when captures are healthy or the field is
+// absent (older backend); otherwise one token with its own tone — dim for
+// 'no_data', because a brand-new install with nothing captured yet is not an
+// alarm — plus the backend's own summary as the hover/AT explanation.
+function captureVerdict(capture) {
+  const v = capture && capture.status
+  if (!v || v === 'ok') return null
+  const label = v === 'outage' ? 'capture down'
+    : v === 'fragmented' ? 'capture split'
+    : v === 'no_data' ? 'no captures yet'
+    : `capture ${v}`
+  return {
+    label,
+    tone: v === 'no_data' ? 'text-(--ui-text-quaternary)' : 'text-(--ui-red)',
+    title: String((capture && capture.summary) || label)
+  }
+}
 // The verdict phrase — the one sentence that answers "are my agents OK right
 // now?" (DESIGN.md FIRST VIEWPORT). Authored ONCE (tick-55): the strip printed
 // it three separate times (the nav button, the plain-span fallback, and the
@@ -211,9 +238,14 @@ const verdictPhrase = (criticals, openSignals) =>
 // without knowing when it was true; timeTitle already carries the cross-year
 // honesty rule). `verdictOverride` exists for the link-down state, where there
 // are no numbers to speak of and the failure itself is the report.
-function statusReadout({ score, level, criticals, openSignals, idle, resolvingCount, tiles, verdictOverride }) {
+// tick-57: an optional `capture` token (the captureVerdict() label object)
+// joins the health line, because a hand-off report is exactly where a
+// "healthy" score computed over a dead pipeline does the most damage — the
+// pasted line must carry the same caveat the strip is showing.
+function statusReadout({ score, level, criticals, openSignals, idle, resolvingCount, tiles, verdictOverride, capture }) {
   const verdict = verdictOverride || verdictPhrase(criticals || 0, openSignals || 0)
   const health = `abyss health: ${score ?? 'unknown'}${level ? ` · ${level}` : ''} · ${verdict}`
+    + (capture ? ` · ${capture.label}` : '')
     + (idle ? ` · idle ${idle.text}` : '')
     + (resolvingCount > 0 ? ` · ${resolvingCount} cloud-agent fix${resolvingCount === 1 ? '' : 'es'} in flight` : '')
   const metrics = (tiles || []).map(t => `${t.label} ${t.value}`).join(' · ')
@@ -945,6 +977,17 @@ function StatusStrip({ ctx, onNavigate }) {
     children: `· idle ${idle.text}`
   }) : null
 
+  // Capture-verdict token (tick-57): the glance's job is "are my agents OK
+  // right now?", and a green 'all clear' computed over a capture outage is the
+  // one answer this instrument must never give silently. Sits on the verdict
+  // line beside idle/resolving, with its own tone (it is a separate fact, not
+  // a signal count) and the backend's summary as its hover/AT disclosure.
+  const captureAlert = captureVerdict(status?.capture)
+  const captureEl = captureAlert ? jsx('span', {
+    className: cn('shrink-0 abyss-tiny uppercase tracking-widest', captureAlert.tone),
+    title: captureAlert.title,
+    children: `· ${captureAlert.label}`
+  }) : null
   // In-flight remediation disclosure (tick-44): /status aggregates how many
   // cloud-agent fixes are running RIGHT NOW (signals + incidents with
   // resolution_status='running' — the value the Watch tab's 8s poll also
@@ -1044,7 +1087,7 @@ function StatusStrip({ ctx, onNavigate }) {
   // operator copied it, formatting included.
   const readout = statusReadout({
     score: healthScore, level: status?.level, criticals, openSignals,
-    idle, resolvingCount, tiles: items
+    idle, resolvingCount, tiles: items, capture: captureAlert
   })
 
   return jsxs('div', {
@@ -1099,6 +1142,7 @@ function StatusStrip({ ctx, onNavigate }) {
               // so the strip, the copy readout and the sr-only echo can never
               // word the same numbers differently.
               verdictPhrase(criticals, openSignals),
+              captureEl,
               idleEl,
               resolvingEl,
               '›'
@@ -1111,6 +1155,7 @@ function StatusStrip({ ctx, onNavigate }) {
                 style: { backgroundColor: criticals > 0 ? 'var(--ui-red)' : openSignals > 0 ? 'var(--ui-yellow)' : 'var(--ui-green)' }
               }),
               verdictPhrase(criticals, openSignals),
+              captureEl,
               idleEl,
               resolvingEl
             ]
@@ -1145,7 +1190,7 @@ function StatusStrip({ ctx, onNavigate }) {
             role: 'status',
             'aria-live': 'polite',
             className: 'sr-only',
-            children: `abyss health: ${verdictPhrase(criticals, openSignals)}${idle ? ` · idle ${idle.text}` : ''}${resolvingCount > 0 ? ` · ${resolvingCount} resolving` : ''}`
+            children: `abyss health: ${verdictPhrase(criticals, openSignals)}${captureAlert ? ` · ${captureAlert.label}` : ''}${idle ? ` · idle ${idle.text}` : ''}${resolvingCount > 0 ? ` · ${resolvingCount} resolving` : ''}`
           })
         ]
       })
@@ -1437,9 +1482,16 @@ function CalendarView({ ctx, onOpenTrace }) {
     const seq = ++fetchSeqRef.current
     setLoading(true)
     setError(null)
+    // Derived BEFORE the try (tick-58): the catch compares `loadedWeekRef`
+    // against startISO to decide whether the visible week's rows may stay, and
+    // a block-scoped const declared inside `try` is NOT visible in `catch` —
+    // the ReferenceError it threw took out the catch itself, so a failed
+    // week-switch fetch left the PREVIOUS week's tasks painted under the new
+    // week's header (the exact outcome this branch exists to prevent) and the
+    // ErrorState never rendered. Both are pure functions of weekStart/weekEnd.
+    const startISO = weekStart.toISOString()
+    const endISO = addDays(weekEnd, 1).toISOString()
     try {
-      const startISO = weekStart.toISOString()
-      const endISO = addDays(weekEnd, 1).toISOString()
       const data = await ctx.rest(`/calendar?start=${encodeURIComponent(startISO)}&end=${encodeURIComponent(endISO)}`, {
         method: 'GET',
         timeoutMs: 5000
@@ -3698,6 +3750,22 @@ function HealthView({ ctx }) {
     children: `· idle ${idle.text}`
   }) : null
 
+  // Capture-verdict token (tick-59): parity with StatusStrip (tick-57) and
+  // the statusbar chip (tick-58). The health TAB is where the score renders
+  // LARGEST — the one surface that answers "are my agents OK right now?" at
+  // full size — yet it only disclosed the idle silence, never the capture
+  // pipeline's own verdict. A green score computed over a dead capture
+  // pipeline is exactly the confident lie tick-57 exists to prevent, and this
+  // was the last surface where it could still be told silently. Same shared
+  // captureVerdict() helper, same tone split (dim for the non-alarm
+  // 'no captures yet'), same backend summary as the hover disclosure.
+  const captureAlert = captureVerdict(status?.capture)
+  const captureEl = captureAlert ? jsx('span', {
+    className: cn('shrink-0 abyss-tiny uppercase tracking-widest', captureAlert.tone),
+    title: captureAlert.title,
+    children: `· ${captureAlert.label}`
+  }) : null
+
   return jsxs('div', {
     className: 'flex h-full flex-col overflow-auto',
     children: [
@@ -3718,6 +3786,7 @@ function HealthView({ ctx }) {
           // at current data volumes (1,073 errors · 4,437 open signals).
           jsx('span', { className: 'text-xs text-(--ui-text-tertiary) abyss-mono tabular-nums', children: `${fmtCount(counts.errors ?? 0)} errors · ${fmtCount(counts.signals_open ?? 0)} open signals · ${fmtCount(counts.incidents_open ?? 0)} open incidents · ${fmtCount(counts.activity_24h ?? 0)} actions/24h` }),
           idleEl,
+          captureEl,
           jsxs('div', {
             className: 'ml-auto flex items-center gap-1.5',
             children: [
@@ -4545,6 +4614,18 @@ function AbyssStatusChip({ ctx }) {
   // closed, so a running cloud-agent fix must be disclosed here too — a
   // healthy-looking score with a resolver actively working is not "fine".
   const resolvingCount = status?.resolutions_running ?? 0
+  // Capture-verdict token (tick-58): parity with the pane's captureEl. The
+  // chip is the ONLY abyss surface while the dashboard is closed, so a green
+  // score printed over a dead capture pipeline is the one glance this
+  // instrument must never give silently. The hover title below already
+  // referenced `captureAlert`, but the identifier was only ever declared
+  // inside StatusStrip — so it was UNRESOLVED here and threw
+  // `ReferenceError: captureAlert is not defined` on the chip's happy path
+  // (the /status success branch), meaning the chip never rendered its reading
+  // at all. Declared here now, and surfaced three ways: the title, a companion
+  // dot (so the closed-dashboard glance can never look unqualified-green
+  // during an outage), and the sr-only name for screen readers.
+  const captureAlert = captureVerdict(status?.capture)
   const tone = idleCritical ? 'text-(--ui-red)'
     : level === 'critical' ? 'text-(--ui-red)'
     : level === 'degraded' ? 'text-(--ui-yellow)'
@@ -4569,7 +4650,8 @@ function AbyssStatusChip({ ctx }) {
       status && jsxs('span', {
         className: cn('flex items-center gap-1 abyss-mono tabular-nums', tone),
         title: (idle ? `last activity ${timeTitle(status.last_activity_at)} · idle ${idle.text}` : (`health ${score ?? '—'}` + (level ? ` · ${level}` : '')))
-          + (resolvingCount > 0 ? ` · ${resolvingCount} cloud-agent fix${resolvingCount === 1 ? '' : 'es'} in flight` : ''),
+          + (resolvingCount > 0 ? ` · ${resolvingCount} cloud-agent fix${resolvingCount === 1 ? '' : 'es'} in flight` : '')
+          + (captureAlert ? ` · ${captureAlert.label} — ${captureAlert.title}` : ''),
         children: [
           jsx('span', {
             className: 'inline-block h-1.5 w-1.5 rounded-full',
@@ -4591,19 +4673,32 @@ function AbyssStatusChip({ ctx }) {
             style: { backgroundColor: 'var(--ui-blue)' },
             children: ''
           }),
+          // Capture-alert companion dot (tick-58). Built exactly like the blue
+          // in-flight marker above — a second, independent fact beside the
+          // score, not a restatement of it. Red for a real capture alert, dim
+          // for the deliberately-non-alarming 'no captures yet' verdict
+          // (captureVerdict's own tone split), so a fresh install doesn't
+          // scream while an outage cannot hide behind a green score.
+          captureAlert && jsx('span', {
+            className: 'inline-block h-1.5 w-1.5 rounded-full',
+            style: { backgroundColor: captureAlert.tone === 'text-(--ui-red)' ? 'var(--ui-red)' : 'var(--ui-text-quaternary)' },
+            children: ''
+          }),
           // Screen-reader parity with the pane's StatusStrip echoes (ticks
-          // 27/39/44): the chip's idle tone, red/blue companion dots and
+          // 27/39/44/58): the chip's idle tone, red/blue companion dots and
           // hover title are all visual-only — a screen-reader operator
           // tabbing through the statusbar hears just 'abyss 87' and cannot
           // tell critical silence from a healthy score, nor that a
-          // cloud-agent fix is in flight. This sr-only child joins the
-          // button's accessible name so focusing the chip speaks the full
-          // disclosure (idle phrase + level + in-flight count). sr-only is
-          // verified compiled in the host bundle (StatusStrip precedent).
+          // cloud-agent fix is in flight, nor that the capture pipeline is
+          // down. This sr-only child joins the button's accessible name so
+          // focusing the chip speaks the full disclosure (level + capture
+          // verdict + idle phrase + in-flight count). sr-only is verified
+          // compiled in the host bundle (StatusStrip precedent).
           jsx('span', {
             className: 'sr-only',
             children: 'abyss health ' + (score ?? 'unknown')
               + (level ? `, ${level}` : '')
+              + (captureAlert ? `, ${captureAlert.label}` : '')
               + (idle ? `, idle ${idle.text}` : '')
               + (resolvingCount > 0 ? `, ${resolvingCount} cloud-agent fix${resolvingCount === 1 ? '' : 'es'} in flight` : '')
           })
@@ -6152,3 +6247,60 @@ export default {
 // `CopyButton` verified exported by the SHIPPED sdk namespace chunk before
 // being imported (a name the runtime shim lacks kills the whole plugin at
 // load). No fetch paths, no backend/Python touched.
+//
+// night-shift-tick-59 (this shift): HealthView capture-verdict parity. The
+// capture-disclosure contract (tick-57) reached the StatusStrip's verdict
+// line and the statusbar chip (tick-58) — but the health TAB itself, the
+// surface where the score renders LARGEST, only disclosed the idle silence;
+// a green "all clear" score computed over a dead capture pipeline could
+// still be told silently at full size, the exact confident lie tick-57
+// exists to prevent. Now the header prints the same shared
+// captureVerdict(status?.capture) token beside idleEl — same tone split
+// (dim for the non-alarm 'no captures yet', red for a real alert), same
+// backend summary as the hover/AT disclosure. No new imports, no fetch
+// paths touched (status already fetched), no class tokens added (all
+// classes already used in the file). Verified post-edit: node
+// --input-type=module --check PASS (CJS check OK too); scope_check.mjs 0
+// unresolved; string-aware brace/paren balance clean; hook order unchanged.
+// No backend/Python touched.
+//
+// night-shift-tick-58 (this shift): two live ReferenceErrors — free identifiers
+// that only ever existed in a SIBLING component's scope, so both threw at
+// runtime instead of rendering. Found with a new acorn-based scope checker
+// (scripts/scope_check.mjs: parses the plugin, builds a real lexical scope
+// tree, reports every reference that resolves to no declaration in its chain —
+// this is the only check that catches this class; node --check, the hook-order
+// script and the Tailwind inventory all pass on a file containing them).
+//   1. AbyssStatusChip (statusbar chip): the hover title read `captureAlert`,
+//      which was declared ONLY inside StatusStrip. On the chip's happy path —
+//      any successful /status fetch — the title expression threw
+//      `ReferenceError: captureAlert is not defined`, so the chip never
+//      rendered its reading. Reproduced in isolation before the fix (extracted
+//      the component, stubbed the SDK/hooks, set a realistic /status payload:
+//      RENDER_THROW ReferenceError). Fixed by declaring it here from the same
+//      shared `captureVerdict(status?.capture)` the strip uses — which also
+//      completes the tick-57 capture-disclosure contract on the one abyss
+//      surface that stays visible while the dashboard is closed: the label now
+//      reaches the hover title (already wired), a companion dot (red for a real
+//      alert, dim for the non-alarm 'no captures yet' verdict, built exactly
+//      like the tick-45 blue in-flight marker), and the sr-only name.
+//   2. CalendarView.fetchTasks: `startISO` was declared with `const` INSIDE the
+//      try, then read in the catch (`loadedWeekRef.current !== startISO`) to
+//      decide whether the visible week's rows could stay. A block-scoped const
+//      is not visible in `catch`, so every FAILED fetch threw a ReferenceError
+//      from inside the catch itself — taking out setError() and leaving the
+//      PREVIOUS week's tasks painted under the new week's header, precisely the
+//      outcome that branch exists to prevent, with no ErrorState. Both startISO
+//      and endISO are pure functions of weekStart/weekEnd, so they are now
+//      derived before the try.
+// Verified post-edit: node --input-type=module --check PASS (CJS check also OK);
+// scope_check.mjs reports 0 unresolved identifiers (only Uint8ClampedArray, a
+// real global, needed whitelisting); check-hook-order clean; Tailwind class
+// inventory re-scanned against the LIVE bundle (index-DHtYck30.css) — 0 missing
+// tokens; the chip's isolated repro now renders and prints the capture verdict
+// in both the title and the sr-only name; import surface unchanged
+// (@hermes/plugin-sdk + react + react/jsx-runtime only); string-aware
+// brace/paren balance clean. Regression guard intact: StatusStrip, VerdictLine,
+// readout, chip dot/tone semantics, Calendar week navigation and the
+// loadedWeekRef no-blink policy all preserved (no props, routes or fetch shapes
+// changed — one const hoisted, one const added). No backend/Python touched.

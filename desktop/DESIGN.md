@@ -169,6 +169,14 @@ Host theme variables only — no hex/rgb literals in the artifact.
 - **Error:** SDK `ErrorState` with a Retry button — errors never masquerade as
   empty data (incumbent P0). StatusStrip prints `status link down` + retry
   instead of a false "all clear".
+- **Capture verdict disclosure:** the backend's multi-store capture verdict
+  (`capture.status` = ok | fragmented | outage | no_data) is the one fact a
+  single-store activity window is structurally blind to — a healthy score can
+  sit over a dead pipeline. Every health surface that prints a score or
+  verdict discloses it: StatusStrip verdict line + copyable readout, the
+  statusbar chip (hover title + companion dot + sr-only name), and the
+  Health tab header (beside the idle token). Tone split: red for a real
+  alert, dim for the non-alarm 'no captures yet'.
 - **Busy:** triage buttons disabled while a mutation runs.
 - **Hover:** rows `hover:bg-(--ui-bg-tertiary)`; graph nodes glow.
 - **Disabled/acknowledged/resolved:** explicit badges so state is never implied

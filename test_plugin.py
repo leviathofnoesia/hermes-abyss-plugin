@@ -17,7 +17,9 @@ profile's activity.db / traces.db are never touched. Exercises:
 import os
 import sys
 import json
+import sqlite3
 import tempfile
+import time
 from pathlib import Path
 
 # Point the plugin at an isolated data dir BEFORE importing it.
@@ -1377,6 +1379,150 @@ def _run_script():
     cs = _capture_status(staleness_hours=0)
     check("_capture_status(0) coerces window to 6.0",
           cs.get("staleness_hours") == 6.0, str(cs.get("staleness_hours")))
+
+    print()
+
+    # ------------------------------------------------------------------
+    print("\nSection: /trends window + bucket bounds, connection hygiene")
+    # get_trends materializes ONE bucket per hour/day, so an unbounded window
+    # made the response size and CPU a linear function of a client-supplied
+    # value: `/trends?days=36500&bucket=hour` built 876,001 buckets (3.7s,
+    # tens of MB) and a larger value pinned the API thread. The REST layer
+    # (`days: int = 7` in plugin_api) has no upper bound, so the bound must
+    # live in the core.
+    reset_db()
+    _add_activity("probe_row", "trend probe", "tool", "completed",
+                  session_id="t1", tool_name="terminal")
+
+    for big in (10 ** 6, 36500, 366):
+        t0 = time.time()
+        tr = handle_request("GET", "/trends", {"days": big, "bucket": "hour"})
+        dt = time.time() - t0
+        n = len(tr.get("timestamps", [])) if isinstance(tr, dict) else -1
+        check(f"trends days={big} series bounded",
+              isinstance(tr, dict) and 0 < n <= 365 * 24 + 2,
+              f"buckets={n} days_echo={tr.get('days') if isinstance(tr, dict) else '?'}")
+        check(f"trends days={big} settles fast", dt < 3.0, f"{dt * 1000:.0f}ms")
+
+    tr = handle_request("GET", "/trends", {})
+    check("trends default window unchanged (UI contract)",
+          isinstance(tr, dict) and tr.get("days") == 7 and tr.get("bucket") == "day",
+          f"days={tr.get('days') if isinstance(tr, dict) else tr}")
+
+    for small in (0, -5):
+        tr = handle_request("GET", "/trends", {"days": small, "bucket": "day"})
+        check(f"trends days={small} still yields a usable window",
+              isinstance(tr, dict) and tr.get("days", 0) >= 1
+              and len(tr.get("timestamps", [])) > 0,
+              f"days_echo={tr.get('days') if isinstance(tr, dict) else '?'}")
+
+    # Unknown bucket: clean 400 from the dispatcher (mirrors /signals state),
+    # coerced to the default day bucket in the library itself so a direct
+    # caller never gets a series whose label format disagrees with its step.
+    rr = handle_request("GET", "/trends", {"days": 7, "bucket": "week"})
+    check("trends bucket=week -> clean 400",
+          isinstance(rr, dict) and rr.get("code") == 400, str(rr)[:110])
+
+    tr = get_trends(days=7, bucket="nonsense")
+    check("get_trends unknown bucket coerces to day",
+          tr.get("bucket") == "day", str(tr.get("bucket")))
+    check("get_trends string days coerced",
+          get_trends(days="abc").get("days") == 7,
+          str(get_trends(days="abc").get("days")))
+
+    # /status capture block: `freshest_capture_at` must be the NEWEST capture
+    # across stores (min() reported the stalest store's timestamp under a
+    # "freshest" name, so one quiet legacy store made the active store's fresh
+    # captures look days old).
+    cap = _capture_status()
+    caps = [s["last_capture"] for s in cap["stores"] if s.get("last_capture")]
+    st = get_status().get("capture") or {}
+    check("status freshest_capture_at = newest store capture",
+          st.get("freshest_capture_at") == (max(caps) if caps else None),
+          f"got={st.get('freshest_capture_at')} want={max(caps) if caps else None} "
+          f"stores_with_rows={len(caps)}")
+
+    # Discriminating case for the same field: with a second, OLDER store in
+    # play, min() returned the quiet store's ancient timestamp while the
+    # active store was capturing seconds ago. Point HERMES_HOME at a scratch
+    # dir holding a stale store so the two candidates differ.
+    _real_home = __init__.HERMES_HOME
+    _alt_home = tempfile.mkdtemp(prefix="abyss-alt-home-")
+    _alt_store = Path(_alt_home) / "abyss-data"
+    _alt_store.mkdir(parents=True, exist_ok=True)
+    _ac = sqlite3.connect(str(_alt_store / "activity.db"))
+    _ac.execute(
+        "CREATE TABLE activity (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "timestamp TEXT NOT NULL, action TEXT NOT NULL, description TEXT, "
+        "category TEXT, status TEXT, metadata TEXT, session_id TEXT, "
+        "tool_name TEXT, args TEXT)")
+    _ac.execute("INSERT INTO activity (timestamp, action) VALUES (?, 'old_row')",
+                ("2001-01-01T00:00:00",))
+    _ac.commit()
+    _ac.close()
+    __init__.HERMES_HOME = _alt_home
+    try:
+        _cap2 = _capture_status()
+        _caps2 = [s["last_capture"] for s in _cap2["stores"] if s.get("last_capture")]
+        _st2 = get_status().get("capture") or {}
+        check("freshest_capture_at ignores an older sibling store",
+              len(_caps2) >= 2
+              and _st2.get("freshest_capture_at") == max(_caps2)
+              and _st2.get("freshest_capture_at") != min(_caps2),
+              f"got={_st2.get('freshest_capture_at')} max={max(_caps2)} "
+              f"min={min(_caps2)} stores={len(_caps2)}")
+    finally:
+        __init__.HERMES_HOME = _real_home
+
+    # get_stats must release its connection on the ERROR path too: a bare
+    # trailing close() leaked one handle + WAL reader per failing /stats poll
+    # (a polled endpoint) for the life of the web-server process.
+    _real_get_conn = __init__._get_activity_conn
+    tally = {"open": 0, "closed": 0}
+
+    class _TrackedConn:
+        def __init__(self, real):
+            self._real = real
+
+        def close(self):
+            tally["closed"] += 1
+            return self._real.close()
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def _tracked_conn():
+        tally["open"] += 1
+        return _TrackedConn(_real_get_conn())
+
+    reset_db()
+    __init__._get_activity_conn = _tracked_conn
+    try:
+        s = get_stats()
+        check("get_stats happy path under tracked conn",
+              isinstance(s, dict) and "total_activities" in s, str(s)[:80])
+        # Force a mid-function sqlite failure: hide the signals table, which
+        # get_stats reads after several activity queries.
+        _c = _real_get_conn()
+        _c.execute("ALTER TABLE signals RENAME TO signals_hidden")
+        _c.commit()
+        _c.close()
+        raised = False
+        try:
+            get_stats()
+        except sqlite3.OperationalError:
+            raised = True
+        finally:
+            _c = _real_get_conn()
+            _c.execute("ALTER TABLE signals_hidden RENAME TO signals")
+            _c.commit()
+            _c.close()
+        check("get_stats propagates a mid-function DB error", raised)
+        check("get_stats closes its connection on the error path",
+              tally["open"] > 1 and tally["closed"] == tally["open"],
+              f"opened={tally['open']} closed={tally['closed']}")
+    finally:
+        __init__._get_activity_conn = _real_get_conn
 
     print()
     print(f"=== RESULT: {PASS} passed, {FAIL} failed ===")

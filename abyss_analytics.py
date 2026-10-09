@@ -14,6 +14,14 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Dict
 
+# Hard ceiling on the trends window. The series is materialized one bucket per
+# hour/day, so an unbounded ``days`` is an unbounded response: the dashboard's
+# own poller asks for `/trends?days=36500&bucket=hour`, which built 876,001
+# buckets (3.7s, tens of MB) before this bound, and a larger value pins the
+# API thread until the client or the process dies. A chart never needs more
+# than a year of history.
+_TRENDS_MAX_DAYS = 365
+
 
 def get_health() -> dict:
     """Compute an overall agent health score (0-100) and a breakdown.
@@ -117,6 +125,24 @@ def get_trends(days: int = 7, bucket: str = "day") -> dict:
     ``bucket`` is one of "hour" | "day". Returns parallel arrays of
     timestamps + counts suitable for sparkline/bar rendering.
     """
+    # Bound the window and whitelist the bucket BEFORE building any buckets.
+    # ``days`` arrives here untouched from the REST layer, where
+    # ``/trends?days=N`` is just an int param with no upper bound — and the
+    # series below is materialized one entry per hour/day, so the response
+    # size (and the CPU to build it) scales linearly with a client-supplied
+    # value. Guarded here as well as in the dispatcher so direct callers
+    # (slash command, tests, other modules) cannot blow the endpoint up either.
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 7
+    days = max(1, min(days, _TRENDS_MAX_DAYS))
+    if bucket not in ("hour", "day"):
+        # An unknown bucket used to fall through to the HOURLY label format
+        # with a DAILY step, so the API echoed e.g. bucket="nonsense" next to
+        # a series whose labels and step disagreed — silently wrong chart
+        # data. Degrade to the documented default instead.
+        bucket = "day"
     from __init__ import _get_activity_conn, _init_db
 
     _init_db()
@@ -476,6 +502,12 @@ def get_status() -> dict:
     # single-store view above can look dead (or blind) while captures flow
     # elsewhere. Attach a compact verdict so the statusbar chip / pollers can
     # flag split-brain or capture outage without scanning stores themselves.
+    # ``freshest_capture_at`` is the MOST RECENT capture across every store
+    # (max of the ISO timestamps), matching abyss_doctor's own notion of
+    # "freshest" (the store with the smallest age). It used to be min(), i.e.
+    # the STALEST store's timestamp, so a healthy install with one quiet
+    # legacy store reported a capture time days old while the active store was
+    # seconds old — a stale reading under a "freshest" name.
     try:
         from abyss_doctor import _capture_status
 
@@ -483,7 +515,7 @@ def get_status() -> dict:
         capture_summary = {
             "status": _cap["status"],
             "summary": _cap["summary"],
-            "freshest_capture_at": min(
+            "freshest_capture_at": max(
                 (s["last_capture"] for s in _cap["stores"]
                  if s.get("last_capture")),
                 default=None,

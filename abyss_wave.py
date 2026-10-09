@@ -225,6 +225,11 @@ def prune_wave_data(days: int = 30) -> dict:
     returns the partial counts and never raises into a hook/command path.
     """
     counts = {table: 0 for table in _WAVE_TABLES}
+    # Defensive bound: `days` is a caller/config-supplied retention window and
+    # feeds timedelta() below, which raises OverflowError for |days| beyond
+    # ~1e9. Bound at the leaf as well as in the core dispatcher.
+    from __init__ import _clamp_days
+    days = _clamp_days(days, 30, minimum=0)
     if days <= 0:
         return counts
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()

@@ -90,7 +90,13 @@ def _resolve_signals_bulk(
     or {"error": ..., "code": 400/500} when no filter is given or a DB error
     occurs (fail-open, matching the plugin's other triage helpers).
     """
-    from __init__ import _get_activity_conn, _init_db
+    from __init__ import _get_activity_conn, _init_db, _clamp_days
+
+    # Bound the day window at the leaf too: it feeds timedelta() below, and an
+    # out-of-range value (the dispatcher and slash parser both accept any
+    # integer) raised OverflowError -> a 500 instead of a triage result.
+    if older_than_days is not None:
+        older_than_days = _clamp_days(older_than_days, 0, minimum=0)
 
     # Require at least one filter — a bare bulk resolve of EVERYTHING would be
     # an operator footgun; the caller must be explicit about scope.

@@ -271,9 +271,15 @@ def get_performance(days: int = 7, limit: int = 20) -> dict:
 
     ``days`` window, ``limit`` top-N per array (sorted by p95 desc).
     """
-    from __init__ import _get_activity_conn, _get_trace_conn, _init_db
+    from __init__ import _get_activity_conn, _get_trace_conn, _init_db, _clamp_days, _clamp_limit
 
     _init_db()
+    # Bound the caller-supplied window and page size at the leaf as well as in
+    # the dispatcher: ``days`` feeds timedelta() below (OverflowError for
+    # |days| > ~1e9 -> a 500 with a traceback), and this function is also
+    # reachable from the slash surface and other modules.
+    days = _clamp_days(days, 7, minimum=1)
+    limit = _clamp_limit(limit, 20)
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
 
     def _pct(sorted_vals, pct):

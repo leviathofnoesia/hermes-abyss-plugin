@@ -805,6 +805,14 @@ def _run_script():
     check("prune_wave_data(0) no-op zeros",
           all(v == 0 for v in zero.values()) and len(zero) == len(wave._WAVE_TABLES),
           str(zero))
+    # A day count beyond timedelta()'s range raised OverflowError out of the
+    # pruner (the core dispatcher, the slash surface and retention_days in
+    # config all feed this leaf). It must clamp, not crash.
+    huge = wave.prune_wave_data(10 ** 12)
+    check("prune_wave_data huge days clamps (no OverflowError)",
+          isinstance(huge, dict) and len(huge) == len(wave._WAVE_TABLES)
+          and all(v == 0 for v in huge.values()),
+          str(huge)[:120])
     # Core _prune_data must merge wave counts so /abyss prune shows them.
     _wave_insert("plugin_events", timestamp=old_ts, namespace="abyss",
                  event="prune_probe2", payload="{}")
